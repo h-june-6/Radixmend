@@ -1,0 +1,73 @@
+[
+  {
+    "data_bits": 23,
+    "word_bits": 32,
+    "r": 5,
+    "code_bits": 29,
+    "roundtrip_values": 8388608,
+    "roundtrip_bad": 0,
+    "flips_1": {
+      "patterns": 64000,
+      "right_index": 64000,
+      "detected": 0,
+      "silent_wrong": 0,
+      "in_code_detect_fail": 0
+    },
+    "flips_2": {
+      "patterns": 992000,
+      "right_index": 210000,
+      "detected": 812000,
+      "silent_wrong": 0,
+      "in_code_detect_fail": 0
+    },
+    "flips_3": {
+      "patterns": 9920000,
+      "right_index": 266000,
+      "detected": 3192000,
+      "silent_wrong": 6552000,
+      "in_code_detect_fail": 0
+    },
+    "ok": true
+  },
+  {
+    "data_bits": 25,
+    "word_bits": 32,
+    "r": 5,
+    "code_bits": 31,
+    "roundtrip_values": 33554432,
+    "roundtrip_bad": 0,
+    "flips_1": {
+      "patterns": 64000,
+      "right_index": 64000,
+      "detected": 0,
+      "silent_wrong": 0,
+      "in_code_detect_fail": 0
+    },
+    "flips_2": {
+      "patterns": 992000,
+      "right_index": 92000,
+      "detected": 930000,
+      "silent_wrong": 0,
+      "in_code_detect_fail": 0
+    },
+    "flips_3": {
+      "patterns": 9920000,
+      "right_index": 30000,
+      "detected": 1240000,
+      "silent_wrong": 8680000,
+      "in_code_detect_fail": 0
+    },
+    "ok": true
+  },
+  {
+    "data_bits": 40,
+    "word_bits": 64,
+    "r": 6,
+    "code_bits": 47,
+    "roundtrip_sampled": 1048576,
+    "roundtrip_bad": 0,
+    "flips_1_fail": 0,
+    "flips_2_fail": 0,
+    "ok": true
+  }
+]

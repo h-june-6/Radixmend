@@ -1,0 +1,236 @@
+"""Software fault injector for KV buffers and slot-index tensors.
+
+Works on plain torch tensors, so it runs the same on CPU (tests) and GPU
+(experiments). The SGLang-facing helpers only rely on a few attributes:
+
+* KV pool (MHATokenToKVPool, NHD layout): ``k_buffer`` / ``v_buffer`` are lists
+  indexed by local layer, each ``[num_slots, head_num, head_dim]``.
+* Radix tree (RadixCache): ``root_node``; TreeNode has ``children`` (dict),
+  ``value`` (slot tensor or None when evicted), ``lock_ref``, ``parent``.
+
+Every injected flip is returned as a record (and can be appended to a JSONL
+log) holding the old and new raw bits, so a campaign can be replayed and its
+effect on values analysed offline.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable, Iterator, Sequence
+
+import torch
+
+_INT_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def int_view(t: torch.Tensor) -> torch.Tensor:
+    """Same-storage integer view with the element width of t."""
+    if not t.dtype.is_floating_point and t.dtype not in (torch.bool,):
+        return t
+    return t.view(_INT_VIEW[t.element_size()])
+
+
+def _bit_value(bit: int, dtype: torch.dtype) -> int:
+    """1 << bit as a value representable in a signed dtype of that width."""
+    width = torch.iinfo(dtype).bits
+    v = 1 << bit
+    if torch.iinfo(dtype).min < 0 and bit == width - 1:
+        v -= 1 << width
+    return v
+
+
+def flip_bits_(t: torch.Tensor, flat_index: Sequence[int], bits: Sequence[int]) -> list[tuple[int, int]]:
+    """Flip ``bits[i]`` of element ``flat_index[i]`` in place; return (old, new) raw ints."""
+    iv = int_view(t).reshape(-1) if t.is_contiguous() else None
+    if iv is None:
+        raise ValueError("flip_bits_ needs a contiguous tensor")
+    width = torch.iinfo(iv.dtype).bits
+    out = []
+    for idx, bit in zip(flat_index, bits):
+        if not 0 <= bit < width:
+            raise ValueError(f"bit {bit} out of range for {width}-bit elements")
+        old = int(iv[idx].item())
+        iv[idx] = old ^ _bit_value(bit, iv.dtype)
+        out.append((old, int(iv[idx].item())))
+    return out
+
+
+# ---- KV faults ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class KVFault:
+    layer: int  # local layer index into k_buffer / v_buffer
+    kind: str  # "k" or "v"
+    slot: int
+    head: int
+    elem: int
+    bit: int  # 0 = mantissa LSB of bf16, 15 = sign
+
+
+@dataclass
+class FlipRecord:
+    target: str
+    fault: dict
+    old_raw: int
+    new_raw: int
+    old_value: float | None = None
+    new_value: float | None = None
+
+
+def _as_float(raw: int, dtype: torch.dtype) -> float | None:
+    if not dtype.is_floating_point:
+        return None
+    iv = torch.tensor([raw], dtype=_INT_VIEW[torch.empty((), dtype=dtype).element_size()])
+    return float(iv.view(dtype).float().item())
+
+
+def inject_kv(k_buffer: Sequence[torch.Tensor], v_buffer: Sequence[torch.Tensor], faults: Iterable[KVFault]) -> list[FlipRecord]:
+    records = []
+    for f in faults:
+        buf = (k_buffer if f.kind == "k" else v_buffer)[f.layer]
+        _, heads, dim = buf.shape
+        flat = (f.slot * heads + f.head) * dim + f.elem
+        (old, new), = flip_bits_(buf, [flat], [f.bit])
+        records.append(
+            FlipRecord("kv", asdict(f), old, new, _as_float(old, buf.dtype), _as_float(new, buf.dtype))
+        )
+    return records
+
+
+def sample_kv_faults(
+    gen: torch.Generator,
+    slots: Sequence[int],
+    layers: Sequence[int],
+    head_num: int,
+    head_dim: int,
+    *,
+    kinds: Sequence[str] = ("k", "v"),
+    bits: Sequence[int] | None = None,
+    elem_bits: int = 16,
+    flips_per_vector: int = 1,
+    vectors: int = 1,
+) -> list[KVFault]:
+    """Pick ``vectors`` random (layer, kind, slot, head) vectors and flip
+    ``flips_per_vector`` distinct bits inside each one.
+
+    With ``bits`` given, every flip uses a bit position from that list (e.g. a
+    single position for a per-bit-position sweep).
+    """
+
+    def pick(seq):
+        return seq[int(torch.randint(len(seq), (1,), generator=gen))]
+
+    faults = []
+    for _ in range(vectors):
+        layer, kind, slot = pick(list(layers)), pick(list(kinds)), pick(list(slots))
+        head = int(torch.randint(head_num, (1,), generator=gen))
+        chosen: set[tuple[int, int]] = set()
+        while len(chosen) < flips_per_vector:
+            elem = int(torch.randint(head_dim, (1,), generator=gen))
+            bit = pick(list(bits)) if bits is not None else int(torch.randint(elem_bits, (1,), generator=gen))
+            chosen.add((elem, bit))
+        faults += [KVFault(layer, kind, slot, head, e, b) for e, b in sorted(chosen)]
+    return faults
+
+
+# ---- index faults -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class IndexFault:
+    target: str  # e.g. "req_to_token", "node.value", "free_pages", "seq_lens"
+    flat_index: int
+    bit: int
+
+
+def inject_index(tensors: dict[str, torch.Tensor], faults: Iterable[IndexFault]) -> list[FlipRecord]:
+    records = []
+    for f in faults:
+        (old, new), = flip_bits_(tensors[f.target], [f.flat_index], [f.bit])
+        records.append(FlipRecord("index", asdict(f), old, new))
+    return records
+
+
+def sample_index_faults(
+    gen: torch.Generator, name: str, tensor: torch.Tensor, n: int, bits: Sequence[int] | None = None,
+    valid_flat: Sequence[int] | None = None,
+) -> list[IndexFault]:
+    """Random index flips; ``valid_flat`` restricts to live entries (e.g. used req rows)."""
+    width = torch.iinfo(int_view(tensor).dtype).bits
+    numel = tensor.numel()
+    out = []
+    for _ in range(n):
+        if valid_flat is not None:
+            idx = valid_flat[int(torch.randint(len(valid_flat), (1,), generator=gen))]
+        else:
+            idx = int(torch.randint(numel, (1,), generator=gen))
+        bit = bits[int(torch.randint(len(bits), (1,), generator=gen))] if bits else int(torch.randint(width, (1,), generator=gen))
+        out.append(IndexFault(name, idx, bit))
+    return out
+
+
+# ---- radix tree targeting -----------------------------------------------------------
+
+
+def iter_nodes(root) -> Iterator[tuple[object, int]]:
+    """(node, depth) for every non-root node with KV on device, depth 1 = child of root."""
+    stack = [(c, 1) for c in root.children.values()]
+    while stack:
+        node, d = stack.pop()
+        if node.value is not None:
+            yield node, d
+        stack.extend((c, d + 1) for c in node.children.values())
+
+
+def count_descendants(node) -> int:
+    return sum(1 + count_descendants(c) for c in node.children.values())
+
+
+def first_level_nodes(root) -> list:
+    """Children of the root. SGLang's root holds no KV, so these hold the most shared prefix."""
+    return [n for n, d in iter_nodes(root) if d == 1]
+
+
+def sink_slots(root, n_tokens: int = 4) -> list[int]:
+    """KV slots of the first ``n_tokens`` tokens under each first-level node (BOS / sink)."""
+    out = []
+    for node in first_level_nodes(root):
+        out += [int(s) for s in node.value[:n_tokens].tolist()]
+    return out
+
+
+def node_slots(node) -> list[int]:
+    return [int(s) for s in node.value.tolist()]
+
+
+def nodes_by_sharing(root, top: int | None = None) -> list[tuple[object, int, int, int]]:
+    """Nodes sorted by (lock_ref, descendants), most shared first: (node, depth, lock_ref, desc)."""
+    rows = [(n, d, n.lock_ref, count_descendants(n)) for n, d in iter_nodes(root)]
+    rows.sort(key=lambda r: (r[2], r[3]), reverse=True)
+    return rows[:top] if top else rows
+
+
+# ---- logging -------------------------------------------------------------------
+
+
+def append_log(path: str | Path, records: Iterable[FlipRecord], **meta) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as fh:
+        for r in records:
+            fh.write(json.dumps({**meta, **asdict(r)}) + "\n")
+
+
+def revert(records: Sequence[FlipRecord], *, k_buffer=None, v_buffer=None, tensors=None) -> None:
+    """Undo flips (in reverse order) so one model run can host many trials."""
+    for r in reversed(records):
+        f = r.fault
+        if r.target == "kv":
+            buf = (k_buffer if f["kind"] == "k" else v_buffer)[f["layer"]]
+            _, heads, dim = buf.shape
+            flip_bits_(buf, [(f["slot"] * heads + f["head"]) * dim + f["elem"]], [f["bit"]])
+        else:
+            flip_bits_(tensors[f["target"]], [f["flat_index"]], [f["bit"]])
