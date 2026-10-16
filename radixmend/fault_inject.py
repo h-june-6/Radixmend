@@ -5,8 +5,10 @@ Works on plain torch tensors, so it runs the same on CPU (tests) and GPU
 
 * KV pool (MHATokenToKVPool, NHD layout): ``k_buffer`` / ``v_buffer`` are lists
   indexed by local layer, each ``[num_slots, head_num, head_dim]``.
-* Radix tree (RadixCache): ``root_node``; TreeNode has ``children`` (dict),
-  ``value`` (slot tensor or None when evicted), ``lock_ref``, ``parent``.
+* Radix tree: the default in SGLang v0.5.22 is UnifiedRadixCache, whose Python
+  tree core (``SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python``) has nodes with
+  ``children`` and ``component_data[FULL]`` holding ``value`` / ``lock_ref``.
+  The legacy TreeNode with ``value`` / ``lock_ref`` fields is also accepted.
 
 Every injected flip is returned as a record (and can be appended to a JSONL
 log) holding the old and new raw bits, so a campaign can be replayed and its
@@ -174,13 +176,28 @@ def sample_index_faults(
 
 # ---- radix tree targeting -----------------------------------------------------------
 
+FULL_COMPONENT = 0  # ComponentType.FULL in sglang.srt.mem_cache.unified_cache
+
+
+def node_value(node):
+    if hasattr(node, "component_data"):
+        return node.component_data[FULL_COMPONENT].value
+    return node.value
+
+
+def node_lock_ref(node) -> int:
+    if hasattr(node, "component_data"):
+        return node.component_data[FULL_COMPONENT].lock_ref
+    return node.lock_ref
+
+
 
 def iter_nodes(root) -> Iterator[tuple[object, int]]:
     """(node, depth) for every non-root node with KV on device, depth 1 = child of root."""
     stack = [(c, 1) for c in root.children.values()]
     while stack:
         node, d = stack.pop()
-        if node.value is not None:
+        if node_value(node) is not None:
             yield node, d
         stack.extend((c, d + 1) for c in node.children.values())
 
@@ -198,17 +215,17 @@ def sink_slots(root, n_tokens: int = 4) -> list[int]:
     """KV slots of the first ``n_tokens`` tokens under each first-level node (BOS / sink)."""
     out = []
     for node in first_level_nodes(root):
-        out += [int(s) for s in node.value[:n_tokens].tolist()]
+        out += [int(s) for s in node_value(node)[:n_tokens].tolist()]
     return out
 
 
 def node_slots(node) -> list[int]:
-    return [int(s) for s in node.value.tolist()]
+    return [int(s) for s in node_value(node).tolist()]
 
 
 def nodes_by_sharing(root, top: int | None = None) -> list[tuple[object, int, int, int]]:
     """Nodes sorted by (lock_ref, descendants), most shared first: (node, depth, lock_ref, desc)."""
-    rows = [(n, d, n.lock_ref, count_descendants(n)) for n, d in iter_nodes(root)]
+    rows = [(n, d, node_lock_ref(n), count_descendants(n)) for n, d in iter_nodes(root)]
     rows.sort(key=lambda r: (r[2], r[3]), reverse=True)
     return rows[:top] if top else rows
 

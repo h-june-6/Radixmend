@@ -1,0 +1,242 @@
+[
+  {
+    "splits": 1,
+    "e_bits": 8,
+    "check_bits": 15,
+    "mem_overhead": 0.0078125,
+    "flips": 1,
+    "corrected": 1.0,
+    "detected": 0.0,
+    "silent": 0.0
+  },
+  {
+    "splits": 1,
+    "e_bits": 8,
+    "check_bits": 15,
+    "mem_overhead": 0.0078125,
+    "flips": 2,
+    "corrected": 0.0,
+    "detected": 1.0,
+    "silent": 0.0
+  },
+  {
+    "splits": 1,
+    "e_bits": 8,
+    "check_bits": 15,
+    "mem_overhead": 0.0078125,
+    "flips": 3,
+    "corrected": 0.0,
+    "detected": 0.7261,
+    "silent": 0.2739
+  },
+  {
+    "splits": 1,
+    "e_bits": 8,
+    "check_bits": 15,
+    "mem_overhead": 0.0078125,
+    "flips": 4,
+    "corrected": 0.0,
+    "detected": 0.99992,
+    "silent": 8e-05
+  },
+  {
+    "splits": 1,
+    "e_bits": 9,
+    "check_bits": 16,
+    "mem_overhead": 0.0078125,
+    "flips": 1,
+    "corrected": 1.0,
+    "detected": 0.0,
+    "silent": 0.0
+  },
+  {
+    "splits": 1,
+    "e_bits": 9,
+    "check_bits": 16,
+    "mem_overhead": 0.0078125,
+    "flips": 2,
+    "corrected": 0.0,
+    "detected": 1.0,
+    "silent": 0.0
+  },
+  {
+    "splits": 1,
+    "e_bits": 9,
+    "check_bits": 16,
+    "mem_overhead": 0.0078125,
+    "flips": 3,
+    "corrected": 0.0,
+    "detected": 0.85816,
+    "silent": 0.14184
+  },
+  {
+    "splits": 1,
+    "e_bits": 9,
+    "check_bits": 16,
+    "mem_overhead": 0.0078125,
+    "flips": 4,
+    "corrected": 0.0,
+    "detected": 0.99992,
+    "silent": 8e-05
+  },
+  {
+    "splits": 2,
+    "e_bits": 7,
+    "check_bits": 14,
+    "mem_overhead": 0.015625,
+    "flips": 1,
+    "corrected": 1.0,
+    "detected": 0.0,
+    "silent": 0.0
+  },
+  {
+    "splits": 2,
+    "e_bits": 7,
+    "check_bits": 14,
+    "mem_overhead": 0.015625,
+    "flips": 2,
+    "corrected": 0.4986,
+    "detected": 0.5014,
+    "silent": 0.0
+  },
+  {
+    "splits": 2,
+    "e_bits": 7,
+    "check_bits": 14,
+    "mem_overhead": 0.015625,
+    "flips": 3,
+    "corrected": 0.0,
+    "detected": 0.93376,
+    "silent": 0.06624
+  },
+  {
+    "splits": 2,
+    "e_bits": 7,
+    "check_bits": 14,
+    "mem_overhead": 0.015625,
+    "flips": 4,
+    "corrected": 0.0,
+    "detected": 0.86758,
+    "silent": 0.13242
+  },
+  {
+    "splits": 2,
+    "e_bits": 8,
+    "check_bits": 15,
+    "mem_overhead": 0.015625,
+    "flips": 1,
+    "corrected": 1.0,
+    "detected": 0.0,
+    "silent": 0.0
+  },
+  {
+    "splits": 2,
+    "e_bits": 8,
+    "check_bits": 15,
+    "mem_overhead": 0.015625,
+    "flips": 2,
+    "corrected": 0.49886,
+    "detected": 0.50114,
+    "silent": 0.0
+  },
+  {
+    "splits": 2,
+    "e_bits": 8,
+    "check_bits": 15,
+    "mem_overhead": 0.015625,
+    "flips": 3,
+    "corrected": 0.0,
+    "detected": 0.96472,
+    "silent": 0.03528
+  },
+  {
+    "splits": 2,
+    "e_bits": 8,
+    "check_bits": 15,
+    "mem_overhead": 0.015625,
+    "flips": 4,
+    "corrected": 0.0,
+    "detected": 0.93114,
+    "silent": 0.06886
+  },
+  {
+    "splits": 4,
+    "e_bits": 6,
+    "check_bits": 13,
+    "mem_overhead": 0.03125,
+    "flips": 1,
+    "corrected": 1.0,
+    "detected": 0.0,
+    "silent": 0.0
+  },
+  {
+    "splits": 4,
+    "e_bits": 6,
+    "check_bits": 13,
+    "mem_overhead": 0.03125,
+    "flips": 2,
+    "corrected": 0.75138,
+    "detected": 0.24862,
+    "silent": 0.0
+  },
+  {
+    "splits": 4,
+    "e_bits": 6,
+    "check_bits": 13,
+    "mem_overhead": 0.03125,
+    "flips": 3,
+    "corrected": 0.37136,
+    "detected": 0.61192,
+    "silent": 0.01672
+  },
+  {
+    "splits": 4,
+    "e_bits": 6,
+    "check_bits": 13,
+    "mem_overhead": 0.03125,
+    "flips": 4,
+    "corrected": 0.09254,
+    "detected": 0.85824,
+    "silent": 0.04922
+  },
+  {
+    "splits": 4,
+    "e_bits": 7,
+    "check_bits": 14,
+    "mem_overhead": 0.03125,
+    "flips": 1,
+    "corrected": 1.0,
+    "detected": 0.0,
+    "silent": 0.0
+  },
+  {
+    "splits": 4,
+    "e_bits": 7,
+    "check_bits": 14,
+    "mem_overhead": 0.03125,
+    "flips": 2,
+    "corrected": 0.75284,
+    "detected": 0.24716,
+    "silent": 0.0
+  },
+  {
+    "splits": 4,
+    "e_bits": 7,
+    "check_bits": 14,
+    "mem_overhead": 0.03125,
+    "flips": 3,
+    "corrected": 0.37386,
+    "detected": 0.61682,
+    "silent": 0.00932
+  },
+  {
+    "splits": 4,
+    "e_bits": 7,
+    "check_bits": 14,
+    "mem_overhead": 0.03125,
+    "flips": 4,
+    "corrected": 0.0945,
+    "detected": 0.876,
+    "silent": 0.0295
+  }
+]

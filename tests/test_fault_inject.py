@@ -59,3 +59,22 @@ def test_tree_targeting():
     assert sorted(fi.sink_slots(root, 4)) == [10, 11, 12, 13, 20, 21]
     top = fi.nodes_by_sharing(root, 2)
     assert top[0][0] is sys_prompt and top[0][3] == 2 and top[1][0] is b
+
+
+class Comp:
+    def __init__(self, value=None, lock_ref=0):
+        self.value, self.lock_ref = value, lock_ref
+
+
+class UNode:
+    def __init__(self, value=None, lock_ref=0):
+        self.children = {}
+        self.component_data = [Comp(value, lock_ref), Comp(), Comp()]
+
+
+def test_unified_tree_nodes():
+    root = UNode([], 1)
+    a = UNode(torch.tensor([5, 6, 7, 8, 9]), 2)
+    root.children = {1: a}
+    assert fi.sink_slots(root, 2) == [5, 6]
+    assert fi.nodes_by_sharing(root)[0][2] == 2

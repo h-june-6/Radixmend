@@ -1,0 +1,112 @@
+# 실험 환경, 워크로드, 비교 절차 명세 (1·5주차 산출물 초안)
+
+GPU를 받기 전에 정할 수 있는 것을 정해 둔 문서다. GPU 실측으로 바뀌는 항목은 **[GPU 확인]**으로 표시했다. SGLang 쪽 근거는 `docs/sglang_code_analysis.md`의 장 번호로 적었다.
+
+## 1. 실험 환경
+
+| 항목 | 값 | 근거 |
+|---|---|---|
+| GPU | NVIDIA RTX A6000 48GB (GDDR6, sm86), 하드웨어 ECC 꺼짐(기본값) | 기술서의 위협 모델. Rowhammer 실증 GPU |
+| 드라이버 | CUDA 13 지원 버전 **[GPU 확인]** | SGLang v0.5.22의 wheel이 cu13 기반(분석 노트 9장) |
+| SGLang | v0.5.22 (`baa9befa3`), 기간 중 고정 | 분석 노트 9장 |
+| 모델 | 주: Qwen3-8B, 보조: Llama-3-8B-Instruct. 둘 다 bf16, head_dim 128, KV head 8 | 선행 연구[1]가 Qwen3-8B를 사용해 재현 비교가 가능함 |
+| attention backend | `--attention-backend triton` (prefill, decode 모두) | in-repo Triton이라 패치 가능(분석 노트 5장) |
+| 고정 설정 | `--page-size 1 --tp-size 1 --kv-cache-dtype auto --kv-canary none`, speculative/HiCache/PD 끔, `--max-total-tokens` 고정 | 분석 노트 9장 |
+| 필수 env | `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` | Rust tree core는 노드에 접근할 수 없음 |
+| 프로토타입 | `--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled`, 모듈 C는 `--disable-overlap-schedule`부터 | 분석 노트 9장 |
+| 최종 측정 | CUDA graph와 overlap은 기본값(켬). 끈 설정은 ablation으로 보고 | |
+| 샘플링 | greedy (temperature 0), 고정 seed | golden 출력과 비교하기 위해 |
+
+A6000 한 장(48GB)에 8B bf16 모델(약 16GB)을 올리면 KV pool로 약 25GB가 남는다. Qwen3-8B는 토큰당 KV가 36층 × 8헤드 × 128 × 2(K, V) × 2바이트 = 147KB이므로 약 17만 토큰이다 **[GPU 확인]**. 체크워드는 그 0.78%로, 약 0.2GB다.
+
+## 2. 워크로드
+
+공유 prefix가 있어야 radix tree의 피해 확산을 볼 수 있다. 모든 워크로드는 요청 순서와 도착 시각을 파일로 고정해 재현한다.
+
+| 이름 | 구성 | 보려는 것 |
+|---|---|---|
+| W1 시스템 프롬프트 공유 | 공통 시스템 프롬프트(약 1K 토큰) + ShareGPT 질문, 요청 200개. SGLang `bench_serving --dataset-name generated-shared-prefix`의 설정으로 생성 가능 | 첫 레벨 노드와 sink 피해, 피해 요청 수 |
+| W2 few-shot | GSM8K 8-shot, MMLU 5-shot (공통 예시 prefix + 문제) | 정답률 변화로 보는 의미적 피해 |
+| W3 다중 턴 대화 | 대화 하나에 4~8턴, 대화 50개 | 깊은 노드, 파생 오염(부모 오염 후 자식 prefill) |
+| W4 분기 트리 | 공통 prefix 하나에 분기 2단계 이상(tree-of-thought 형태) | 자손 노드 수와 계보 무효화 정밀도 |
+| W5 재사용 없음 | W1과 같은 요청에 `SGLANG_RADIX_FORCE_MISS=1` | prefix 공유 효과를 뺀 대조군 |
+
+성능 측정(RQ3)에는 W1, W3와 함께 공유가 없는 ShareGPT 표준 부하도 쓴다. 이렇게 하면 결과가 SGLang 공식 벤치마크와 비교 가능하다.
+
+## 3. 결함 주입 방식
+
+도구는 `radixmend/fault_inject.py`다. 주입은 KV가 저장되어 트리에 들어간 뒤, 그 노드가 다시 읽히기 전에 한다. 트리에 접근하는 경로는 Python tree core 노드의 `component_data[FULL].value`다.
+
+- **K/V 텐서**: (layer, K|V, slot, head, element, bit)를 지정한다. bit 0~15를 따로 sweep한다.
+- **위치**: 첫 레벨 노드의 첫 4토큰(sink), 첫 레벨 노드의 나머지, 깊이 2 이상의 노드, 공유도(lock_ref, 자손 수) 상위 노드.
+- **인덱스**: `req_to_token`(int32), `node.value`, `free_pages`, `seq_lens`(int64)의 상위·하위 비트.
+- **다중 비트**: 같은 벡터 안 2, 3, 4비트. 벡터 안 위치는 무작위로 고르거나, 같은 원소에 몰거나, 인접 원소로 고른다.
+
+시행마다 플립 기록(JSONL, 원래와 바뀐 비트 및 값)을 남기고, 끝나면 `revert`로 되돌린다. 같은 서버 프로세스로 여러 시행을 돌리되, 시행 사이에 `flush_cache`로 트리를 비워 서로 섞이지 않게 한다 **[GPU 확인: flush 비용]**.
+
+## 4. 판정 지표
+
+- **출력 변화**: greedy golden 출력과 토큰 시퀀스가 하나라도 다르면 "변화"로 센다. 처음 달라진 위치와 편집 거리도 기록한다.
+- **의미적 피해**: W2는 정답률 차이로 본다. 기술서가 말한 "문법적으로 자연스러운데 다른 출력"은 golden과 다르면서 perplexity가 정상 범위인 경우로 정의한다.
+- **피해 범위**: 출력이 바뀐 요청 수, 오염된 노드 수(파생 오염 포함). 파생 오염 노드는 fault 실행의 자식 노드 KV와 golden 실행의 같은 토큰 KV를 비교해, 오차가 bf16 반올림 수준(재실행 비결정성)을 넘으면 오염으로 센다 **[GPU 확인: 무결함 재실행 두 번의 KV 차이로 임계값을 정함]**.
+- **크래시/혼입**: 엔진 중단, CUDA illegal address, 다른 요청의 slot 접근(slot 번호 로그로 확인).
+
+## 5. 연구 질문별 절차
+
+### RQ1 특성 분석 (3~5주차)
+
+1. 무결함 기준선을 만든다. 워크로드마다 golden 출력, TPOT, TTFT, 처리량, 메모리를 기록한다. 같은 설정으로 두 번 돌려 비결정성의 폭도 잰다.
+2. 선행 연구 재현: V 텐서 단일 비트, 16개 비트 위치마다 150회(Qwen3-8B). [1]의 "비트 0만으로 64%" 결과와 비교한다.
+3. K와 V 비교: 같은 절차를 K 텐서에 반복한다.
+4. 위치 비교: sink 4토큰, 첫 레벨 노드, 깊은 노드. 비트 위치는 2~3단계에서 영향이 컸던 위치로 고정한다.
+5. 인덱스 결함: 텐서와 비트 위치마다 크래시, 혼입, 조용한 변화의 비율을 잰다.
+6. 파생 오염 실증: 부모 노드에 주입한 뒤 자식을 prefill하고, 부모를 복구해도 자식이 틀린 채 남는지 확인한다. 무보호 상태와 hit 시점 해시 상태 모두에서 한다.
+
+**통계**: 비율에는 Wilson 95% 신뢰구간을 붙인다. 150회면 비율 50% 근처에서 구간 폭이 약 ±8%p다. 두 조건(예: K 대 V)의 차이는 Fisher exact test로 본다. 시행 수는 1단계에서 잰 시행당 시간을 보고 정한다 **[GPU 확인]**.
+
+### RQ2 정확성·교정 (7, 14주차)
+
+- 무결함 시 출력이 보호 전과 비트 단위로 같아야 한다(greedy, 같은 batch 구성).
+- 단일 플립 교정률: K/V × 16비트 위치 × 위치 3종. 목표 100%.
+- 체크워드 플립: 데이터 보존과 체크워드 복원.
+- 2비트 탐지율: 목표 100%. 탐지 뒤 재계산 경로로 넘어가는지도 확인한다.
+- 3비트 이상: 오교정률 실측치를 `docs/secded_verification.md`의 전수 계산값과 대조한다.
+
+### RQ3 비용 (3주차 선측정, 7·14주차)
+
+- decode TPOT, TTFT, 처리량(tokens/s), 최대 동시 요청 수, 메모리.
+- 오버헤드를 decode와 extend 경로로 나눠 잰다. 커널 단위는 `nsys`나 Triton benchmark로, 서버 단위는 `bench_serving`으로 측정한다.
+- 조건: 무보호, 검사만(신드롬 계산), 검사+교정, 전체(A+B+C). 목표는 TPOT 증가 3% 미만.
+- 3주차 선측정에서 3%를 크게 넘으면 코드워드 분할, 검사 위치(타일 로드 직후 대 softmax 전), 워프 리덕션 방식을 먼저 바꿔 본다.
+
+### RQ4 봉쇄·복구 (9, 14주차)
+
+- 2비트 오류를 첫 레벨 노드와 깊은 노드에 주입해 영향받은 요청 수, 파생 오염 노드 수, 재등록 요청 수, 복구 지연(탐지부터 정상 출력 재개까지)을 잰다.
+- 모듈 D를 켠 경우와 끈 경우를 비교한다(재등록을 피한 요청 수).
+
+## 6. 비교 대상
+
+### 6.1 hit 시점 해시 [1]를 SGLang에 이식
+
+- 노드 KV가 완성되어 트리에 들어갈 때 노드 단위(page_size 1이면 노드 전체, 또는 고정 크기 블록 단위)로 SHA-256 digest를 계산해 노드에 저장한다. 계산은 GPU에서 KV를 바이트로 보고 해시한다. SGLang에 GPU SHA-256이 없으므로, CPU로 복사해 `hashlib`로 계산하는 버전(정확하지만 느림)과 GPU Adler-32(`kernels/ops/memory/adler32.py` 재사용, 빠름)를 둘 다 구현해 비용 비교에 쓴다.
+- prefix 매칭에서 hit가 나면 매칭된 노드마다 digest를 다시 계산해 비교한다. 다르면 그 노드부터 아래를 버리고 재계산한다.
+- 삽입 위치는 Python tree core의 insert와 match 경로다(분석 노트 2, 8장).
+- 이 구현으로 보일 것: hit 시점 검증과 사용 시점 사이의 창(TOCTOU)에서 생기는 파생 오염을 막지 못한다는 것(RQ1 6단계).
+
+### 6.2 하드웨어 ECC
+
+- A6000에서 `nvidia-smi -e 1` 후 재부팅하면 켜진다. 관리자 권한과 재부팅이 필요하다 **[GPU 확인: 서버 권한]**.
+- 같은 워크로드로 가용 메모리(6.25% 감소 예상), 처리량, TPOT을 잰다.
+- 소프트웨어 주입은 ECC가 보호하는 DRAM을 거치지 않으므로, ECC의 교정·탐지 능력은 실측이 아니라 SECDED(72,64)의 이론값으로 비교한다. 이 한계는 보고서에 적는다.
+
+## 7. GPU를 받은 날 확인할 것
+
+1. `nvidia-smi`: 드라이버 버전, CUDA 13 지원 여부, ECC 상태.
+2. SGLang v0.5.22 설치 후 Qwen3-8B를 `--attention-backend triton`으로 띄운다. 출력이 flashinfer 기본값과 같은지(greedy) 확인한다.
+3. `TRITON_INTERPRET` 없이 `pytest tests/`를 돌려 Triton 커널이 GPU에서도 통과하는지 본다.
+4. `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python`에서 처리량이 Rust core 대비 얼마나 떨어지는지 잰다. 차이가 크면 비용 측정의 기준선을 Python core로 통일한다.
+5. 무결함 실행 두 번의 출력과 KV 차이를 잰다. 파생 오염 판정 임계값을 이 값으로 정한다.
+
+## 참고
+
+[1] Y. Yamamoto, S. Matsuura, "Bit-Flip Vulnerability of Shared KV-Cache Blocks in LLM Serving Systems," arXiv:2604.17249, 2026.
