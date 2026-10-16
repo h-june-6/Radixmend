@@ -139,50 +139,112 @@
 <li style="margin:4px 0;"><strong style="font-weight:700;">RQ3 비용</strong>: TPOT, TTFT, 처리량, 메모리. decode와 extend 경로를 나눠서 측정(목표 TPOT 증가 3% 미만)</li>
 <li style="margin:4px 0;"><strong style="font-weight:700;">RQ4 봉쇄·복구</strong>: 영향받은 요청 수, 파생 오염 노드 수, 재계산 복구 지연</li>
 </ul>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">16주 계획</h2>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">16주 계획 (WBS)</h2>
 <table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
 <thead>
 <tr class="header">
-<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">주차</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">주</th>
 <th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">단계</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">수행 내용</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">주요 산출물</th>
 </tr>
 </thead>
 <tbody>
 <tr class="odd">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">1~2</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">준비: SGLang 코드 분석, 결함 주입기, 기준선 측정, SECDED 참조 구현</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">1</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">준비 및 기준선 구축</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">SGLang 버전 확정, radix tree·KV 풀·attention 커널 코드 분석<br>attention 백엔드 결정<br>워크로드 선정, 실험 환경·재현 스크립트 구성<br>결함 주입 도구 개발 착수</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">코드 분석 노트, 대상 버전·백엔드 명세<br>워크로드 명세, 실험 환경 명세</td>
 </tr>
 <tr class="even">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">3~5</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">영향 분석(RQ1), hit 시점 해시 이식, 설계 확정</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">2</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">준비 및 기준선 구축</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">결함 주입 도구 완성 (KV 텐서, 슬롯 인덱스)<br>무결함 기준선 측정 (출력, TPOT, TTFT, 처리량, 메모리)<br>SECDED 참조 구현 및 단위 테스트: 체크비트 포함 전체 코드워드 기준 단일 오류 전수 교정, 이중 오류 전수 탐지</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">결함 주입기<br>기준선 데이터<br>SECDED 참조 구현, 전수 검증 결과</td>
 </tr>
 <tr class="odd">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">6~7</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">모듈 A 구현과 검증</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">3</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">영향 분석 및 리스크 확인</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">K·V 텐서 비트 위치별 영향 측정<br>커널 검사 프로토타입: 신드롬 계산만 넣고 decode·extend 경로별 오버헤드 선측정</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">K vs V 비트 위치별 데이터<br>선행 연구 대비 재현 결과<br>커널 오버헤드 선측정치</td>
 </tr>
 <tr class="even">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">8~9</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">모듈 C 구현과 검증</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">4</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">영향 분석</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">attention sink·첫 레벨 노드 위치 영향 측정<br>인덱스 결함 영향 측정<br>파생 오염 실증 (무보호 상태)<br>hit 시점 해시 기법 SGLang 이식 착수</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">위치별 영향 데이터<br>인덱스 결함 유형별 결과<br>파생 오염 재현 사례 (무보호)</td>
 </tr>
 <tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">5</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">영향 분석 정리 및 설계 확정</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">해시 기법 이식 완료, 해시 적용 상태에서 파생 오염 재현<br>특성 분석 결과 정리 (RQ1)<br>RQ1 결과 반영해 모듈 A·B·C·D 설계 및 위협 모델 확정<br>하드웨어 ECC 비교 조건 구성<br>보고서: 배경·RQ1 분석 절 작성</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">RQ1 분석 보고<br>비교용 해시 구현체, 해시 적용 하 파생 오염 사례<br>모듈 설계서, 위협 모델 문서 (확정)<br>비교 실험 절차서</td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">6</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">구현 (모듈 A)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">KV 저장 커널에 encode-at-store 융합, 체크워드 버퍼 할당<br>decode/extend 커널 신드롬 검사·1비트 레지스터 교정 구현 착수<br>오류 로그 버퍼 구현</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">인코딩 코드<br>수정된 attention 커널 (1차)<br>오류 로그 버퍼</td>
+</tr>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">7</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">구현 및 검증 (모듈 A)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">커널 레지스터 교정 완료, scrub 커널 구현<br>커널 정확성 검증<br>RQ2(A): K/V 비트 위치별 단일 플립 교정률, 체크비트 오류 시 데이터 보존, 2비트 탐지율<br>RQ3(A): decode·extend 경로별 TPOT·TTFT·처리량·메모리 오버헤드<br>보고서: 모듈 A 설계 절 작성</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">모듈 A 구현 코드 (커널, scrub 커널)<br>정확성 검증 결과<br>모듈 A 교정·탐지율, 오버헤드 데이터</td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">8</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">구현 (모듈 C)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">2비트 탐지 시 요청 단위 오류 플래그 기록, next_token_ids 복사에 실어 스케줄러로 전달<br>스텝 단위 폐기: 해당 스텝의 KV·샘플 토큰 폐기, overlap scheduler 다음 스텝 결과 폐기, 플래그 처리 전 트리 삽입 보류<br>노드 poisoned 표시, prefix 매칭 차단, 공유 요청 retract_decode 재등록·재prefill<br>born_epoch/clean_epoch 추적 착수</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">스케줄러 수정 (1차)<br>오류 플래그 전달 경로</td>
+</tr>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">9</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">구현 및 검증 (모듈 C)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">lock_ref 0 이후 노드 해제, extend·chunked prefill 중 탐지 시 재등록 경로, 영구 결함 슬롯 격리 옵션<br>epoch 기반 정밀 무효화 완료<br>파생 오염 차단 확인<br>RQ4 예비 측정: 피해 범위·재계산 복구 지연<br>보고서: 모듈 C 설계 절 작성</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">계보 기반 복구 로직 (재등록 기반)<br>파생 오염 차단 결과<br>봉쇄·복구 예비 데이터</td>
+</tr>
+<tr class="even">
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">10</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">모듈 D 구현과 검증</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">구현 및 검증 (모듈 D)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">RQ1 결과로 보호 대상 확정: 첫 레벨 노드 중 공유도 기준 선정, sink 구간은 피해가 클 때 포함<br>사본 버퍼 구현 , 사본 체크워드 검증<br>2비트 탐지 시 사본 즉시 복원 경로 연결<br>사본 버퍼 메모리 비용, 복원 지연, 재등록 회피 요청 수 측정<br>보고서: 모듈 D 설계 절 작성</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">차등 보호 코드<br>사본 복원 검증 결과, 비용 데이터</td>
+</tr>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">11</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">구현 (모듈 B)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">인덱스 텐서 소비 지점 전수 목록화<br>디코드 choke point 설계<br>미사용 상위 비트 SECDED 인코딩 구현</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">인덱스 소비 지점 목록, choke point 설계<br>인덱스 인코딩 코드</td>
 </tr>
 <tr class="even">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">11~12</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">모듈 B 구현과 검증</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">12</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">구현 및 검증 (모듈 B)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">choke point 및 나머지 소비 지점(스케줄러 등)에 검사·교정·마스킹 삽입<br>req_to_token ↔︎ node.value 교차 복구 구현<br>무결함 정확성 확인, 인덱스 단일 비트 교정·2비트 교차 복구·범위 밖 접근 차단 검증<br>보고서: 모듈 B 설계 절 작성</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">모듈 B 구현 코드<br>인덱스 교정·교차 복구·차단 검증 결과</td>
 </tr>
 <tr class="odd">
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">13</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">통합</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">통합 및 검증</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">전체 모듈 통합, 모듈별 활성화 옵션 구성<br>통합 후 정확성 재확인 (무결함 시 출력 동일성)<br>통합 테스트 (다중 요청, 공유 prefix)<br>평가 자동화 스크립트 완성</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">통합 빌드<br>정확성 재확인 결과, 통합 테스트 결과<br>평가 자동화 스크립트</td>
 </tr>
 <tr class="even">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">14~15</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">평가(RQ2~4), 기존 기법 비교, 코드워드 길이 트레이드오프</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">14</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">평가</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">RQ2 최종: 통합 빌드 기준 교정률·탐지율 (모듈별 측정치와 대조)<br>RQ3 최종: decode·extend 경로별 TPOT, TTFT, 처리량, 메모리 오버헤드<br>RQ4 최종: 피해 범위(영향 요청 수, 파생 오염 노드 수)·복구 지연<br>기존 기법(hit 해시, 하드웨어 ECC) 비교 평가 착수</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">최종 교정·탐지율 표<br>성능 오버헤드 데이터<br>봉쇄·복구 데이터</td>
 </tr>
 <tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">15</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">평가 완료</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">기존 기법 비교 평가 완료<br>모듈별 기여도 분석<br>3비트 이상 한계 실험<br>코드워드 길이 트레이드오프 실험 (헤드 벡터 전체 vs 2~4개 분할: 메모리 오버헤드 대비 교정·탐지율)<br>결과 통계 처리 및 그래프 작성 시작</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">비교 결과표<br>ablation 결과, 한계 분석<br>코드워드 길이 트레이드오프 데이터</td>
+</tr>
+<tr class="even">
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">16</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">최종 보고서, 코드 정리, 발표</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">결과 정리 및 마무리</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">결과 통계·그래프 완성<br>최종 보고서 작성<br>코드 정리 및 재현 가이드<br>발표 자료 작성</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">그래프·표<br>최종 보고서<br>소스 코드, 발표 자료</td>
 </tr>
 </tbody>
 </table>
