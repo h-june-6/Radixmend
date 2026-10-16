@@ -1,11 +1,11 @@
 <!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 11주차·선행] 남는 상위 비트에 ECC 넣기: 슬롯 인덱스 SECDED</title></head>
+<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 11주차·선행] 안 쓰는 상위 비트에 ECC 넣기</title></head>
 <body style="max-width:820px;margin:40px auto;padding:0 16px;font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#222;">
-<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 11주차·선행] 남는 상위 비트에 ECC 넣기: 슬롯 인덱스 SECDED</h1>
+<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 11주차·선행] 안 쓰는 상위 비트에 ECC 넣기</h1>
 <blockquote style="margin:16px 0;padding:12px 16px;border-left:4px solid #4a7bd0;background:#f3f6fb;color:#333;">
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">모듈 B는 11~12주차 계획이지만, 인코딩 자체는 순수 계산이라 GPU 없이 먼저 만들고 검증했다. 인덱스 소비 지점 목록도 1주차 코드 분석에서 대부분 정리됐다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">모듈 B는 원래 11~12주차 일정이다. 그런데 인코딩 자체는 순수 계산이라 GPU 없이 먼저 만들고 검증했다. 인덱스를 쓰고 읽는 곳 목록도 1주차 코드 분석 때 대부분 정리해 뒀다.</p>
 </blockquote>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">이번 주 목표 (WBS)와 진행</h2>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">이번 주에 하기로 한 것 (WBS)과 진행 상황</h2>
 <table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
 <thead>
 <tr class="header">
@@ -15,39 +15,38 @@
 </thead>
 <tbody>
 <tr class="odd">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">인덱스 텐서 소비 지점 전수 목록화</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">인덱스 텐서를 쓰는 곳 전수 목록화</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;">코드 분석으로 초안 완료</strong></td>
 </tr>
 <tr class="even">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">디코드 choke point 설계</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;">후보 확정</strong> (아래)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">디코드할 choke point 설계</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;">후보 확정</strong></td>
 </tr>
 <tr class="odd">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">미사용 상위 비트 SECDED 인코딩 구현</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;">완료, 전수 검증</strong></td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">안 쓰는 상위 비트에 SECDED 인코딩 구현</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;">구현, 전수 검증 완료</strong></td>
 </tr>
 </tbody>
 </table>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">1. 왜 인덱스인가</h2>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">KV 슬롯 번호가 뒤집히면 피해가 KV 값 오류보다 크다. 상위 비트가 뒤집히면 KV 풀 밖을 읽어 엔진이 죽는다. 하위 비트가 뒤집히면 다른 요청의 유효한 슬롯을 읽어 요청 사이에 데이터가 섞인다. 그런데 슬롯 번호는 비트를 다 쓰지 않는다. A6000에서 8B 모델이면 KV 풀이 대략 2×10^5 슬롯으로 18비트면 충분하다. int32에는 13비트가 남는다.</p>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">2. 비트 배치</h2>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">왜 인덱스까지 지키나</h2>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">KV 슬롯 번호가 깨지면 KV 값 하나가 깨지는 것보다 훨씬 위험하다. 상위 비트가 뒤집히면 KV 풀 밖을 읽어서 엔진이 죽는다. 하위 비트가 뒤집히면 다른 요청의 멀쩡한 슬롯을 읽어서, 요청끼리 데이터가 섞인다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">다행히 슬롯 번호는 비트를 다 안 쓴다. A6000에 8B 모델을 올리면 KV 풀이 대략 20만 슬롯이라 18비트면 된다. int32면 13비트가 남는다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">비트 배치</h2>
 <pre style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.5;margin:16px 0;"><code style="font-family:Consolas,Menlo,monospace;background:none;padding:0;">bit:  31   30..29   28   27 ........ 23   22 .................... 0
-      부호  (미사용)  전체   해밍 체크 5비트    슬롯 번호 23비트 (그대로)
-      =0             패리티</code></pre>
+      부호  (안 씀)  전체   해밍 체크 5비트    슬롯 번호 23비트 (그대로)
+      =0            패리티</code></pre>
 <ul style="font-size:16px;line-height:1.8;margin:12px 0;padding-left:24px;">
-<li style="margin:4px 0;">슬롯 번호를 하위 비트에 <strong style="font-weight:700;">그대로</strong> 둔다(systematic). <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">v &amp; data_mask</code>가 곧 슬롯 번호다.</li>
-<li style="margin:4px 0;">해밍 체크비트 5개와 전체 패리티 1비트로 확장 해밍(SECDED)을 만든다.</li>
-<li style="margin:4px 0;">부호 비트는 항상 0이다. SGLang이 쓰는 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">-1</code> sentinel은 부호 비트가 켜져 있어서 인코딩된 값과 구분된다.</li>
-<li style="margin:4px 0;">int32에는 데이터가 최대 25비트(2^25 슬롯)까지 들어간다. int64는 56비트까지 된다.</li>
+<li style="margin:4px 0;">슬롯 번호를 아래쪽 비트에 <strong style="font-weight:700;">그대로</strong> 둔다. <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">v &amp; data_mask</code>가 곧 슬롯 번호다.</li>
+<li style="margin:4px 0;">그 위에 해밍 체크비트 5개와 전체 패리티 1비트를 붙여서 확장 해밍(SECDED)을 만든다.</li>
+<li style="margin:4px 0;">int32에는 슬롯 번호를 최대 25비트(2^25 슬롯)까지 넣을 수 있다. int64는 56비트까지 된다.</li>
 </ul>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">데이터를 제자리에 두면 좋은 점이 두 가지 있다. choke point의 디코드가 마스크 한 번과 XOR 몇 번이면 끝난다. 그리고 디코드를 빠뜨린 경로가 있으면 상위 비트 때문에 값이 범위 밖으로 나가서, SGLang store 커널의 device assert에 걸려 바로 멈춘다. 조용히 다른 슬롯을 읽는 일이 없다.</p>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">선형 코드라 0의 코드워드는 0이다. SGLang의 zeros 버퍼, padding 슬롯 0, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">req_to_token</code>의 빈 칸이 모두 그대로 유효한 코드워드라서 따로 초기화할 필요가 없다.</p>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">3. 검증</h2>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">데이터를 제자리에 두면 좋은 점이 두 가지다. choke point에서 디코드하는 게 마스크 한 번과 XOR 몇 번으로 끝난다. 그리고 어딘가에서 디코드를 빠뜨리면 상위 비트 때문에 값이 범위 밖으로 튀어서, SGLang 저장 커널의 device assert에 걸려 바로 멈춘다. 몰래 다른 슬롯을 읽는 일은 없다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">검증 결과</h2>
 <table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
 <thead>
 <tr class="header">
 <th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">구성</th>
-<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">사용 비트</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">쓰는 비트</th>
 <th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">모든 값 왕복</th>
 <th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">단일 플립 (32비트 전부)</th>
 <th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">코드 안 이중 플립</th>
@@ -71,32 +70,45 @@
 <tr class="odd">
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">int64, 40비트</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">47</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">2^20개 표본 정상</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">2^20개 샘플 정상</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">전부 올바른 슬롯</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">전부 탐지</td>
 </tr>
 </tbody>
 </table>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">미사용 상위 비트(23비트 구성에서 29, 30번과 부호 비트)의 플립은 정보가 없으므로 디코드할 때 지운다. 삼중 플립은 23비트 구성에서 66%가 조용히 틀린 슬롯이 된다. 일반 확장 해밍 코드와 같은 수준이다.</p>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">4. 소비 지점과 choke point</h2>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">1주차 분석에서 인덱스를 쓰고 읽는 곳을 정리했다.</p>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">쓰기 (인코딩 지점)</strong></p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">안 쓰는 상위 비트(23비트 구성이면 29, 30번과 부호 비트)가 뒤집힌 건 디코드할 때 그냥 지운다. 아무 정보도 없는 비트라서다. 삼중 플립은 23비트 구성에서 66%가 조용히 틀린 슬롯이 되는데, 일반 확장 해밍 코드와 같은 수준이다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">쓰는 곳과 choke point</h2>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">쓰는 곳 (인코딩해야 하는 곳)</strong></p>
 <ul style="font-size:16px;line-height:1.8;margin:12px 0;padding-left:24px;">
-<li style="margin:4px 0;">extend: <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">write_req_to_token_pool_triton</code> (prefix와 새 슬롯을 함께 기록)</li>
+<li style="margin:4px 0;">extend: <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">write_req_to_token_pool_triton</code> (prefix와 새 슬롯을 같이 기록)</li>
 <li style="margin:4px 0;">decode: <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">alloc_for_decode_default</code></li>
-<li style="margin:4px 0;">트리 삽입 후 행 재지정: <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">checkpoint_into_tree</code></li>
+<li style="margin:4px 0;">트리에 넣은 뒤 행을 트리 슬롯으로 다시 가리키는 곳: <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">checkpoint_into_tree</code></li>
 </ul>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">읽기 (디코드 choke point)</strong></p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">읽는 곳 (디코드 choke point)</strong></p>
 <ul style="font-size:16px;line-height:1.8;margin:12px 0;padding-left:24px;">
-<li style="margin:4px 0;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">create_flashinfer_kv_indices_triton</code>: Triton과 FlashInfer 백엔드가 공유하는 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">kv_indices</code> 생성 커널. 디코드를 여기 한 곳에 넣으면 attention 경로 전체가 덮인다.</li>
-<li style="margin:4px 0;">슬롯 할당·해제 경로 (<code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">free_pages</code> 조작)</li>
-<li style="margin:4px 0;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">// page_size</code> 같은 산술과 torch 인덱싱 직전</li>
+<li style="margin:4px 0;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">create_flashinfer_kv_indices_triton</code>: Triton과 FlashInfer 백엔드가 같이 쓰는 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">kv_indices</code> 생성 커널. 여기 한 곳에 디코드를 넣으면 attention 경로가 전부 덮인다.</li>
+<li style="margin:4px 0;">슬롯 할당·해제 (<code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">free_pages</code> 조작)</li>
+<li style="margin:4px 0;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">// page_size</code> 같은 산술이나 torch 인덱싱 직전</li>
 </ul>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">out_cache_loc</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">req_to_token</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">node.value</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">free_pages</code>에 같은 코드를 쓰면 구조 사이를 오갈 때 다시 인코딩할 필요가 없다. 인코딩된 값이 31비트 이하라 int64↔︎int32 변환에서도 그대로 유지된다.</p>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">주의할 점</strong>: FlashAttention 3 백엔드는 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">req_to_token</code> 행을 그대로 page table로 넘긴다. 별도 복사 커널이 없어서 상위 비트가 커널까지 간다. Triton 백엔드를 1차 대상으로 정한 이유가 하나 더 생긴 셈이다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">out_cache_loc</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">req_to_token</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">node.value</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">free_pages</code>에 같은 코드를 쓰면 값이 이 구조들 사이를 옮겨 다닐 때 다시 인코딩할 필요가 없다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">트러블슈팅</h2>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">1. 해밍 코드를 교과서대로 넣으면 슬롯 번호가 흩어진다</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> 교과서식 해밍 코드는 체크비트를 1, 2, 4, 8번째처럼 2의 거듭제곱 자리에 끼워 넣는다. 그렇게 하면 데이터 비트가 사이사이로 흩어져서, 슬롯 번호를 쓰려면 매번 비트를 다시 모아야 한다. 디코드를 빠뜨린 경로가 있으면 완전히 엉뚱한 슬롯을 읽게 된다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> 같은 해밍 코드를 systematic 형태로 바꿨다. 데이터 비트 i에 "2의 거듭제곱이 아닌 i번째 값"을 열로 배정하고, 체크비트는 데이터 위쪽에 따로 모았다. 교정·탐지 능력은 똑같고, 슬롯 번호는 아래쪽에 그대로 남는다.</p>
+<pre style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.5;margin:16px 0;"><code style="font-family:Consolas,Menlo,monospace;background:none;padding:0;">cols = [v for v in range(1, 1 &lt;&lt; r) if v &amp; (v - 1)]   # 2의 거듭제곱 제외
+data_cols = cols[:data_bits]</code></pre>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">2. SGLang이 쓰는 -1과 0</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> SGLang은 "값 없음"을 나타낼 때 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">-1</code>을 쓰는 곳이 있고, padding 슬롯으로 0을 쓴다. 인코딩된 값이 이 특수값과 겹치면 안 된다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> 두 가지 다 자연스럽게 풀렸다. <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">-1</code>은 모든 비트가 1이라 부호 비트가 켜져 있는데, 인코딩된 값은 부호 비트를 항상 0으로 두니까 겹칠 일이 없다. 디코드 함수는 음수를 그대로 통과시키면 된다. 0은 선형 코드라서 0의 코드워드가 그대로 0이다. 그래서 SGLang이 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">torch.zeros</code>로 만든 버퍼, padding 슬롯 0, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">req_to_token</code>의 빈칸이 모두 따로 초기화하지 않아도 유효한 코드워드다.</p>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">3. int32에 얼마나 넣을 수 있나</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">req_to_token</code>은 int32인데, 부호 비트까지 건드리면 위의 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">-1</code> 구분이 깨진다. 그러면 슬롯 번호는 몇 비트까지 넣을 수 있을까?</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> 해밍 체크비트 r개로 감당할 수 있는 데이터 비트는 2^r − 1 − r개다. r=5면 26비트인데, 전체 패리티 1비트와 부호 비트를 빼야 하니 25 + 5 + 1 = 31비트가 int32에서 쓸 수 있는 최대다. 그래서 KV 풀 상한은 2^25(약 3,355만) 슬롯이 된다. 26비트를 넣으려고 하면 에러가 나도록 했고, 테스트로도 확인했다.</p>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">4. FlashAttention 3에서는 상위 비트가 커널까지 그대로 간다</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> 코드를 보니 FlashAttention 3 백엔드는 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">req_to_token</code> 행을 그대로 page table로 넘긴다. 중간에 복사하는 커널이 없어서, 인코딩된 상위 비트가 디코드되지 않은 채 attention 커널까지 간다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> 1차 대상을 Triton 백엔드로 정한 이유가 하나 더 생겼다. Triton과 FlashInfer는 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">kv_indices</code> 생성 커널을 거치니까 거기서 디코드하면 된다. FA3까지 지원하려면 page table을 만드는 모든 경로에 디코드 복사를 넣어야 해서 범위 밖으로 뺐다.</p>
 <h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">남은 일 (12주차)</h2>
 <ul style="font-size:16px;line-height:1.8;margin:12px 0;padding-left:24px;">
-<li style="margin:4px 0;">choke point와 나머지 소비 지점에 디코드·마스킹 삽입</li>
+<li style="margin:4px 0;">choke point와 나머지 쓰는 곳에 디코드·마스킹 넣기</li>
 <li style="margin:4px 0;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">req_to_token</code> ↔︎ <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">node.value</code> 교차 복구</li>
 <li style="margin:4px 0;">실제 서버에서 인덱스 단일 비트 교정, 2비트 교차 복구, 범위 밖 접근 차단 확인</li>
 </ul>

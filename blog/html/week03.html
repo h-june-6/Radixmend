@@ -1,17 +1,17 @@
 <!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 3주차·선행] GPU 없이 Triton 커널 검증하기: encode, 읽기 시점 교정, scrub</title></head>
+<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 3주차·선행] GPU 없이 Triton 커널 검증하기</title></head>
 <body style="max-width:820px;margin:40px auto;padding:0 16px;font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#222;">
-<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 3주차·선행] GPU 없이 Triton 커널 검증하기: encode, 읽기 시점 교정, scrub</h1>
+<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 3주차·선행] GPU 없이 Triton 커널 검증하기</h1>
 <blockquote style="margin:16px 0;padding:12px 16px;border-left:4px solid #4a7bd0;background:#f3f6fb;color:#333;">
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">3주차 계획에는 "신드롬 계산만 넣은 커널 프로토타입으로 decode·extend 경로 오버헤드 선측정"이 있다. 오버헤드 측정은 GPU가 있어야 하지만, 커널이 맞게 계산하는지는 CPU에서도 확인할 수 있다. 그래서 커널 정확성 검증을 먼저 해 두었다. 이 커널들은 6~7주차 모듈 A 구현의 뼈대가 된다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">3주차 계획에는 "신드롬 계산만 넣은 커널 프로토타입으로 decode·extend 오버헤드 선측정"이 있다. 오버헤드는 GPU가 있어야 잴 수 있지만, 커널이 계산을 맞게 하는지는 CPU에서도 확인할 수 있다. 그래서 그 부분만 먼저 했다. 여기서 만든 커널들은 6~7주차 모듈 A 구현의 뼈대가 된다.</p>
 </blockquote>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">이번 주 목표 (WBS)</h2>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">이번 주에 하기로 한 것 (WBS)</h2>
 <ul style="font-size:16px;line-height:1.8;margin:12px 0;padding-left:24px;">
-<li style="margin:4px 0;">K·V 텐서 비트 위치별 영향 측정 → GPU 필요, 미착수</li>
-<li style="margin:4px 0;">커널 검사 프로토타입: 신드롬 계산만 넣고 decode·extend 경로별 오버헤드 선측정 → <strong style="font-weight:700;">커널 작성과 정확성 검증 완료, 오버헤드 측정은 GPU 필요</strong></li>
+<li style="margin:4px 0;">K·V 텐서 비트 위치별 영향 측정 → GPU 필요, 아직 못 함</li>
+<li style="margin:4px 0;">커널 검사 프로토타입과 decode·extend 경로별 오버헤드 선측정 → <strong style="font-weight:700;">커널 작성과 정확성 검증은 끝, 오버헤드 측정은 GPU 필요</strong></li>
 </ul>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">1. 왜 독립 커널부터 만들었나</h2>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">최종 목표는 SGLang Triton 백엔드의 decode/extend attention 커널 안, K/V 타일을 load한 직후에 검사를 넣는 것이다. 하지만 바로 attention 커널을 고치면 attention 수학과 SECDED 수학의 버그가 섞인다. 그래서 같은 연산을 하는 독립 커널 세 개를 먼저 만들고, 2주차에 검증한 numpy 참조 구현과 비트 단위로 맞췄다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">왜 독립 커널부터 만들었나</h2>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">최종 목표는 SGLang Triton 백엔드의 decode/extend attention 커널 안, K/V 타일을 읽은 바로 다음에 검사를 넣는 거다. 그런데 처음부터 attention 커널을 고치면 attention 계산 버그와 SECDED 계산 버그가 뒤섞여서 어디가 틀렸는지 찾기 어렵다. 그래서 같은 계산만 하는 커널 세 개를 따로 만들고, 2주차에 검증한 numpy 구현과 비트 단위로 맞췄다.</p>
 <table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
 <thead>
 <tr class="header">
@@ -24,24 +24,24 @@
 <tr class="odd">
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">encode_kernel</code></td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">새로 쓴 K/V 행의 체크워드 계산</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">KV store 커널 (encode-at-store)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">KV 저장 커널 (encode-at-store)</td>
 </tr>
 <tr class="even">
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">check_load_kernel</code></td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">slot 번호로 벡터를 gather하면서 신드롬 계산, 1비트는 레지스터에서 교정, 오류는 로그에 atomic 기록</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">decode/extend attention의 타일 load 직후</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">slot 번호로 벡터를 모아 오면서 신드롬 계산, 1비트는 레지스터에서 교정, 오류는 로그에 기록</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">decode/extend attention의 타일 읽기 직후</td>
 </tr>
 <tr class="odd">
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">scrub_kernel</code></td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">로그의 벡터를 재검증한 뒤 메모리에 교정값 쓰기</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">별도 커널 (스텝 사이 또는 유휴 시간)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">로그에 남은 벡터를 다시 검사하고 메모리에 고친 값 쓰기</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">별도 커널 (스텝 사이나 쉬는 시간)</td>
 </tr>
 </tbody>
 </table>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">2. 커널에서의 계산</h2>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">원소마다 하는 일은 popcount와 XOR뿐이다. Triton 인터프리터에서도 돌아가도록 popcount 대신 XOR 접기로 패리티를 구했다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">커널에서 하는 계산</h2>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">원소마다 하는 일은 패리티 계산과 XOR뿐이다.</p>
 <pre style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.5;margin:16px 0;"><code style="font-family:Consolas,Menlo,monospace;background:none;padding:0;">@triton.jit
-def _par16(v):
+def _par16(v):           # 16비트 값의 패리티
     v = v ^ (v &gt;&gt; 8)
     v = v ^ (v &gt;&gt; 4)
     v = v ^ (v &gt;&gt; 2)
@@ -50,20 +50,19 @@ def _par16(v):
 
 @triton.jit
 def _data_terms(x, e_lab, bmask_ptr, B: tl.constexpr):
-    par = _par16(x)                                     # 원소별 패리티
-    p = tl.sum(par, axis=0) &amp; 1                         # P
-    se = tl.reduce(tl.where(par == 1, e_lab, 0), 0, _xor)   # S_e
+    par = _par16(x)                                         # 원소별 패리티
+    p = tl.sum(par, axis=0) &amp; 1                             # P
+    se = tl.reduce(tl.where(par == 1, e_lab, 0), 0, _xor)  # S_e
     sb = p * 0
-    for k in tl.static_range(B):                        # S_b, 비트마다 마스크 하나
+    for k in tl.static_range(B):                            # S_b: 비트마다 마스크 하나
         m = tl.load(bmask_ptr + k)
         sb = sb | ((tl.sum(_par16(x &amp; m), axis=0) &amp; 1) &lt;&lt; k)
     return p, se, sb</code></pre>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">교정은 분기 없이 한다. 판정이 "데이터 오류"이고 원소 번호가 맞는 lane만 해당 비트를 XOR한다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">교정은 분기 없이 한다. "데이터 오류"로 판정됐고 원소 번호가 맞는 lane만 그 비트를 XOR한다.</p>
 <pre style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.5;margin:16px 0;"><code style="font-family:Consolas,Menlo,monospace;background:none;padding:0;">fix = tl.where((status == 1) &amp; (d == elem), 1 &lt;&lt; bit, 0)
-x = x ^ fix          # attention 수학은 고친 값을 쓰고, 메모리는 그대로 둔다</code></pre>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">메모리를 커널 안에서 바로 고치지 않는 이유는 기술서에 적은 대로다. 같은 벡터를 여러 CTA가 동시에 읽을 수 있고(prefix 공유, split-KV, GQA), 3비트 이상의 오교정 값이 메모리에 영구히 남으면 안 된다. 1주차 코드 분석에서 extend 커널이 같은 prefix 벡터를 여러 번 읽는다는 것을 확인했기 때문에 이 분리가 더 중요해졌다.</p>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">3. CPU에서 검증: <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">TRITON_INTERPRET=1</code></h2>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">Triton은 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">TRITON_INTERPRET=1</code>이면 커널을 numpy로 해석해서 실행한다. GPU 없이 결과를 확인할 수 있다.</p>
+x = x ^ fix    # attention 계산은 고친 값으로 하고, 메모리는 손대지 않는다</code></pre>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">커널 안에서 메모리를 바로 고치지 않는 이유는 기술서에 쓴 그대로다. 같은 벡터를 여러 CTA가 동시에 읽을 수 있고(prefix 공유, split-KV, GQA), 3비트 이상 오류를 잘못 고친 값이 메모리에 박히면 안 된다. 1주차에 extend 커널이 같은 prefix 벡터를 여러 번 읽는다는 걸 확인해서 이 분리가 더 중요해졌다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">결과</h2>
 <pre style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.5;margin:16px 0;"><code style="font-family:Consolas,Menlo,monospace;background:none;padding:0;">TRITON_INTERPRET=1 python -m pytest tests/test_triton_kernels.py</code></pre>
 <table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
 <thead>
@@ -74,32 +73,51 @@ x = x ^ fix          # attention 수학은 고친 값을 쓰고, 메모리는 �
 </thead>
 <tbody>
 <tr class="odd">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">encode 결과 vs numpy 참조 구현</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">비트 단위 일치</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">encode 결과 vs numpy 구현</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">비트 단위로 같음</td>
 </tr>
 <tr class="even">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">한 벡터의 단일 오류 2,063개 (데이터 2048 + 체크비트 15)</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">모두 교정</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">벡터 하나의 단일 오류 2,063개 (데이터 2048 + 체크비트 15)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">전부 교정</td>
 </tr>
 <tr class="odd">
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">데이터 오류, 체크워드 오류, 이중 오류를 섞은 배치</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">각각 교정 / 체크워드만 교정 / 탐지로 판정, 메모리는 그대로</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">각각 교정 / 체크워드만 교정 / 탐지. 메모리는 그대로</td>
 </tr>
 <tr class="even">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">check_load 후 scrub</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">메모리 값과 체크워드 복원. 같은 벡터가 로그에 두 번 있어도 결과 동일. 이중 오류는 쓰지 않음</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">check_load 다음 scrub</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">메모리 값과 체크워드 복원. 같은 벡터가 로그에 두 번 있어도 결과 같음. 이중 오류는 안 건드림</td>
 </tr>
 <tr class="odd">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">scrub 후 다시 check_load</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">이중 오류 벡터만 다시 로그에 남음</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">scrub 뒤에 다시 check_load</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">이중 오류 벡터만 로그에 남음</td>
 </tr>
 </tbody>
 </table>
-<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">4. 아직 모르는 것</h2>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">트러블슈팅</h2>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">1. GPU가 없는데 Triton 커널을 어떻게 돌리나</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> Triton 커널은 보통 CUDA GPU에서만 돈다. 개발 환경엔 GPU가 없었다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">TRITON_INTERPRET=1</code>을 켜면 Triton이 커널을 numpy로 해석해서 CPU에서 실행해 준다. 엄청 느리지만 결과는 같아서 정확성 검증엔 충분하다. 테스트 파일은 GPU가 있으면 GPU에서, 없으면 인터프리터 모드일 때만 돌고 그 외엔 건너뛰게 했다. 나중에 GPU 서버에서 같은 테스트를 그대로 돌리면 된다.</p>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">2. popcount와 XOR 리덕션을 인터프리터에서 쓰기</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> 패리티는 보통 popcount로 구하는데, Triton에서 popcount는 CUDA libdevice 함수(<code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">popc</code>)를 불러야 하고, 이건 인터프리터에서 쓸 수 없다. 또 S_e는 원소 128개를 XOR로 합쳐야 하는데, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">tl.sum</code> 같은 내장 XOR 리덕션은 없다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> 패리티는 시프트하고 XOR하는 걸 네 번 반복하는 방식(XOR 접기)으로 바꿨다. GPU에서도 정수 연산 몇 개라 느리지 않다. XOR 리덕션은 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">tl.reduce</code>에 XOR 결합 함수를 직접 넘겼다. 본 커널을 쓰기 전에 원소 128개를 XOR로 합치는 작은 커널부터 만들어서 numpy 결과와 같은지 먼저 확인했다.</p>
+<pre style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.5;margin:16px 0;"><code style="font-family:Consolas,Menlo,monospace;background:none;padding:0;">@triton.jit
+def _xor(a, b):
+    return a ^ b
+
+se = tl.reduce(values, 0, _xor)</code></pre>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">3. 같은 벡터가 로그에 여러 번 찍힌다</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> attention 커널은 같은 벡터를 여러 번 읽을 수 있어서, 오류 하나가 로그에 여러 번 기록된다. scrub 커널이 로그대로 무작정 고치면 같은 비트를 두 번 뒤집어서 원래대로 되돌려 버릴 수 있다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> scrub 커널은 로그를 그대로 믿지 않고, 메모리에서 벡터를 다시 읽어 신드롬을 새로 계산한다. 이미 고쳐진 벡터면 "정상"으로 나와서 아무것도 안 한다. 그 사이에 오류가 더 쌓여서 이제 단일 오류가 아니면 역시 쓰지 않는다. 이렇게 하면 같은 항목을 몇 번 처리해도 결과가 같다. 같은 벡터를 두 번 기록해 놓고 결과가 같은지 테스트로 확인했다.</p>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">4. 테스트가 틀렸던 경우</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> scrub 후에 다시 읽으면 이중 오류 벡터가 로그에 두 번 남을 거라고 테스트를 썼는데 실제로는 한 번이었다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">원인.</strong> 커널이 아니라 테스트가 틀렸다. 그 테스트에서 이중 오류 벡터(slot 20)는 읽기 목록에 한 번만 들어 있었다. 두 번 읽은 건 단일 오류 벡터(slot 3) 쪽이었고, 그건 scrub으로 이미 고쳐져서 로그에 안 남는 게 맞다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> 기대값을 1로 고쳤다. 커널 결과를 의심하기 전에 테스트의 전제부터 다시 보는 게 빠르다는 걸 또 배웠다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">아직 모르는 것</h2>
 <ul style="font-size:16px;line-height:1.8;margin:12px 0;padding-left:24px;">
-<li style="margin:4px 0;"><strong style="font-weight:700;">오버헤드.</strong> 인터프리터는 느려서 속도를 재는 의미가 없다. GPU에서 decode/extend를 따로 재야 한다. 목표는 TPOT 증가 3% 미만이다.</li>
-<li style="margin:4px 0;"><strong style="font-weight:700;">attention 커널 안에서의 배치.</strong> decode 커널은 K 타일이 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">[BLOCK_DMODEL, BLOCK_N]</code>이라 열 하나가 벡터 하나다. 리덕션 방향이 독립 커널과 다르므로 옮길 때 다시 맞춰야 한다.</li>
-<li style="margin:4px 0;">3%를 크게 넘으면 시도할 것: 코드워드 분할, 검사 위치 변경(타일 load 직후 대 softmax 전), 워프 셔플 리덕션.</li>
+<li style="margin:4px 0;"><strong style="font-weight:700;">오버헤드.</strong> 인터프리터는 느려서 속도를 재 봐야 의미가 없다. GPU에서 decode와 extend를 따로 재야 한다. 목표는 TPOT 증가 3% 미만이다.</li>
+<li style="margin:4px 0;"><strong style="font-weight:700;">attention 커널 안으로 옮기기.</strong> decode 커널은 K 타일이 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">[BLOCK_DMODEL, BLOCK_N]</code> 모양이라 열 하나가 벡터 하나다. 리덕션 방향이 독립 커널과 달라서 옮길 때 다시 맞춰야 한다.</li>
+<li style="margin:4px 0;">3%를 크게 넘으면 코드워드 나누기, 검사 위치 옮기기(타일 읽은 직후 대신 softmax 전), 워프 셔플 리덕션을 차례로 시도해 볼 생각이다.</li>
 </ul>
 <hr style="border:none;border-top:1px solid #ddd;margin:32px 0;" />
 <p style="font-size:16px;line-height:1.8;margin:12px 0;">코드: <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">radixmend/kernels/secded_triton.py</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">tests/test_triton_kernels.py</code></p>
