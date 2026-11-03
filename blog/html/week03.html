@@ -1,9 +1,10 @@
 <!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 3주차·선행] GPU 없이 Triton 커널 검증하기</title></head>
+<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 3주차·선행] Triton 커널을 검증하고, 실험 서버에 맞춰 계획을 고쳤다</title></head>
 <body style="max-width:820px;margin:40px auto;padding:0 16px;font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#222;">
-<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 3주차·선행] GPU 없이 Triton 커널 검증하기</h1>
+<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 3주차·선행] Triton 커널을 검증하고, 실험 서버에 맞춰 계획을 고쳤다</h1>
 <blockquote style="margin:16px 0;padding:12px 16px;border-left:4px solid #4a7bd0;background:#f3f6fb;color:#333;">
 <p style="font-size:16px;line-height:1.8;margin:12px 0;">3주차 계획에는 "신드롬 계산만 넣은 커널 프로토타입으로 decode·extend 오버헤드 선측정"이 있다. 오버헤드는 GPU가 있어야 잴 수 있지만, 커널이 계산을 맞게 하는지는 CPU에서도 확인할 수 있다. 그래서 그 부분만 먼저 했다. 여기서 만든 커널들은 6~7주차 모듈 A 구현의 뼈대가 된다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">이번 주에는 실험할 GPU도 정했다. 대학교에서 빌릴 수 있는 서버가 CUDA 12.2라서 SGLang 버전을 낮췄고, 처음 계획한 시행 횟수로는 GPU를 너무 오래 잡고 있어야 해서 실험 규모도 줄였다. 이 과정은 트러블슈팅 5~7에 정리했다.</p>
 </blockquote>
 <h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">이번 주에 하기로 한 것 (WBS)</h2>
 <ul style="font-size:16px;line-height:1.8;margin:12px 0;padding-left:24px;">
@@ -113,12 +114,136 @@ se = tl.reduce(values, 0, _xor)</code></pre>
 <p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> scrub 후에 다시 읽으면 이중 오류 벡터가 로그에 두 번 남을 거라고 테스트를 썼는데 실제로는 한 번이었다.</p>
 <p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">원인.</strong> 커널이 아니라 테스트가 틀렸다. 그 테스트에서 이중 오류 벡터(slot 20)는 읽기 목록에 한 번만 들어 있었다. 두 번 읽은 건 단일 오류 벡터(slot 3) 쪽이었고, 그건 scrub으로 이미 고쳐져서 로그에 안 남는 게 맞다.</p>
 <p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> 기대값을 1로 고쳤다. 커널 결과를 의심하기 전에 테스트의 전제부터 다시 보는 게 빠르다는 걸 또 배웠다.</p>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">5. 빌릴 수 있는 GPU가 CUDA 12.2였다</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> 실험은 대학교에서 빌릴 수 있는 서버로 하기로 했다. RTX A6000이 7장 꽂혀 있어서 기술서에 적은 GPU와 똑같다. 그런데 CUDA가 12.2였다. 1주차에 고정한 SGLang v0.5.22는 torch 2.14.1, flashinfer 0.7.1이 전부 CUDA 13 빌드라, 드라이버가 580 이상이어야 돌아간다. CUDA 12.2면 드라이버는 535 계열일 가능성이 크다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">원인.</strong> SGLang은 v0.5.20부터 CUDA 13 빌드만 배포한다. 공식 설치 문서에도 "CUDA 12 빌드(cu129)가 있는 마지막 버전은 v0.5.19"라고 나와 있다. PyTorch 2.14부터 CUDA 12.9 빌드가 없어진 영향이다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">검토한 방법.</strong></p>
+<table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
+<thead>
+<tr class="header">
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">방법</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">판단</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">서버 드라이버를 580 이상으로 올리기</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">가장 깔끔하지만 여러 사람이 같이 쓰는 서버라 내 마음대로 못 한다</td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">CUDA 호환성 패키지(cuda-compat)로 옛 드라이버에서 CUDA 13 쓰기</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">root 없이 되지만, A6000과 535 드라이버 조합이 지원되는지 확실하지 않다</td>
+</tr>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">Colab이나 RunPod 같은 클라우드 GPU</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">돌아가긴 하지만 돈이 들고, Colab은 세션이 끊길 때마다 다시 설치해야 한다. 둘 다 ECC를 켜고 끌 수 없다</td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">SGLang을 v0.5.19로 낮추기</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">CUDA 12 빌드가 공식으로 있다. 대신 지금까지 한 코드 분석을 다시 맞춰야 한다</td>
+</tr>
+</tbody>
+</table>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> SGLang을 <strong style="font-weight:700;">v0.5.19로 낮췄다.</strong> v0.5.22보다 한 달 정도 앞선 버전(2026년 9월)이라 큰 구조가 거의 같을 거라고 봤다. 설치는 공식 문서에 나온 CUDA 12 절차를 따른다.</p>
+<pre style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.5;margin:16px 0;"><code style="font-family:Consolas,Menlo,monospace;background:none;padding:0;">uv pip install --prerelease=allow sglang==0.5.19
+uv pip install --force-reinstall torch==2.13.0 torchaudio==2.11.0 torchvision \
+    --index-url https://download.pytorch.org/whl/cu129
+uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/</code></pre>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">CUDA 12.9 빌드가 CUDA 12.2 드라이버에서 도는지는 같은 12 계열 안의 호환성에 기대는 거라 서버에서 직접 확인해야 한다.</p>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">6. 버전을 낮추고 나서 한 일</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> 1주차 코드 분석 문서는 전부 v0.5.22 기준이다. 모듈 A~D를 어디에 끼울지, 결함을 어디에 주입할지가 그 분석에 기대고 있다. 버전을 낮췄는데 설계가 전제하는 사실 하나가 달라지면 그 모듈의 삽입 위치가 통째로 바뀐다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">한 일.</strong> v0.5.19와 v0.5.22를 둘 다 받아서, 설계가 기대는 사실을 하나씩 v0.5.19에서 다시 확인했다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">다행히 핵심은 그대로였다.</p>
+<ul style="font-size:16px;line-height:1.8;margin:12px 0;padding-left:24px;">
+<li style="margin:4px 0;">tree는 여전히 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">UnifiedRadixCache</code>이고, 노드의 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">value</code>는 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">req_to_token</code> 행을 int64로 복사한 GPU 텐서다. 모듈 B의 교차 복구 원천으로 쓸 수 있다.</li>
+<li style="margin:4px 0;">KV free list(<code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">free_pages</code>)는 GPU int64 텐서이고, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">req_to_token</code>은 int32다.</li>
+<li style="margin:4px 0;">KV 저장 커널은 JIT CUDA <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">store_cache</code>이고, Triton backend도 그대로 있다.</li>
+<li style="margin:4px 0;">다음 decode 입력 토큰을 GPU <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">FutureMap.output_tokens_buf</code>에서 가져오는 구조, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">seq_lens_cpu</code> 미러, 체크워드 크기를 더할 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">_compute_cell_size</code>도 다 있다.</li>
+<li style="margin:4px 0;">실험에 쓰는 서버 옵션(<code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">--kv-canary</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">--cuda-graph-backend-decode</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">--disable-overlap-schedule</code>)도 있다.</li>
+</ul>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">달라진 건 다섯 가지였고, 하나씩 조치했다.</p>
+<table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
+<thead>
+<tr class="header">
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">달라진 것</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">v0.5.22</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">v0.5.19</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">조치</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">tree core 기본값</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">Rust (노드 접근 불가)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;">Python</strong></td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">오히려 편해졌다. 그래도 실행 스크립트에 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python</code>을 적어 두고, "Rust 대비 처리량 비교" 항목은 뺐다</td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">tree 삽입 API</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">checkpoint_into_tree</code></td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">cache_finished_req</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">cache_unfinished_req</code></strong></td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">해시 비교 기법의 digest 계산과 모듈 C의 삽입 게이팅 위치를 이 두 함수로 옮겼다</td>
+</tr>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">Triton의 KV 인덱스 생성</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">KVIndexTranslator</code>를 거침</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">_fill_kv_indptr_and_indices</code>에서 <strong style="font-weight:700;">바로</strong> 생성</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">모듈 B의 decode를 이 함수 한 곳에 넣으면 일반 경로와 CUDA graph 경로를 같이 덮는다. 한 단계 단순해졌다</td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">GPU 해시 커널</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">adler32.py</code>(Adler-32) 있음</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;">없음</strong>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">gpu_tensor_hash.py</code>만 있음</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">비교 기법의 빠른 해시 버전을 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">gpu_tensor_hash</code>로 바꿨다</td>
+</tr>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">component 파일 이름</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">full.py</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">base.py</code></td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">full_component.py</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">tree_component.py</code></td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">경로만 바꿨다</td>
+</tr>
+</tbody>
+</table>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">결과는 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">docs/sglang_v0519_diff.md</code>에 따로 정리했다. 기존 분석 문서의 줄 번호는 v0.5.22 기준으로 남겨 두고, 패치할 때는 이 차이 문서를 먼저 보기로 했다. 실험 명세의 환경 표도 v0.5.19(torch 2.13.0, cu129)로 고쳤다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">여기서 배운 건, 버전을 고정해 둔다고 끝이 아니라는 점이다. 분석 문서에 "어떤 사실에 기대고 있는지"를 따로 정리해 둔 덕에 다시 확인할 목록이 바로 나왔다.</p>
+<h3 style="font-size:18px;font-weight:700;line-height:1.4;margin:28px 0 10px;">7. 계획한 시행 횟수로는 GPU를 너무 오래 잡는다</h3>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">문제.</strong> 실험 명세에는 비트 위치 16개마다 150회씩 돌리는 식으로 시행 횟수를 잡아 뒀다. K와 V, 위치, 인덱스, 교정 검증, 봉쇄·복구를 다 더하니 서버 시행이 약 13,000회였다. 시행 하나가 30초~1분이라고 치면 개발과 비용 측정까지 합쳐 **GPU 200~400시간**이 나온다. 공용 서버에서 GPU 한 장을 이렇게 오래 붙잡고 있을 수는 없다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;"><strong style="font-weight:700;">해결.</strong> 통계적으로 의미가 남는 선에서 시행 수를 줄였다. 원칙은 두 가지다.</p>
+<ol style="font-size:16px;line-height:1.8;margin:12px 0;padding-left:24px;">
+<li style="margin:4px 0;"><strong style="font-weight:700;">넓게 훑을 때는 적게, 중요한 곳에만 많이.</strong> 비트 16개는 50회씩만 돌린다. 50회면 신뢰구간이 ±14%p 정도라 비트 사이의 큰 차이는 충분히 보인다. 영향이 큰 비트 4개만 150회로 늘려서 선행 연구와 같은 조건으로 비교한다.</li>
+<li style="margin:4px 0;"><strong style="font-weight:700;">결과가 거의 정해진 항목은 적게.</strong> 크래시나 1비트 교정 성공처럼 될지 안 될지가 거의 정해진 항목은 30회 이하로 줄였다. 교정률은 서버를 돌리는 대신 커널 단위로 전수 검사하는 테스트를 주된 근거로 쓴다.</li>
+</ol>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">시행 하나도 가볍게 만들었다. 요청은 200개 대신 20개만 쓰고(공유 prefix는 그대로 둔다), 출력은 64토큰에서 자르고, golden 출력은 조건마다 한 번만 만들어 재사용한다.</p>
+<table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
+<thead>
+<tr class="header">
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;"></th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">처음 계획</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">줄인 계획</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">서버 시행 수</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">약 13,000회</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">약 2,500회</td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">예상 GPU 시간</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">200~400시간</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">80~150시간</td>
+</tr>
+</tbody>
+</table>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">시행당 시간은 아직 재 보지 않아서 위 숫자는 추정이다. 첫날 시행 하나에 걸리는 시간을 재고 다시 맞출 생각이다. 효과가 50% 근처로 애매하게 나오는 조건이 있으면 그 조건만 150회로 늘린다.</p>
 <h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">아직 모르는 것</h2>
 <ul style="font-size:16px;line-height:1.8;margin:12px 0;padding-left:24px;">
 <li style="margin:4px 0;"><strong style="font-weight:700;">오버헤드.</strong> 인터프리터는 느려서 속도를 재 봐야 의미가 없다. GPU에서 decode와 extend를 따로 재야 한다. 목표는 TPOT 증가 3% 미만이다.</li>
 <li style="margin:4px 0;"><strong style="font-weight:700;">attention 커널 안으로 옮기기.</strong> decode 커널은 K 타일이 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">[BLOCK_DMODEL, BLOCK_N]</code> 모양이라 열 하나가 벡터 하나다. 리덕션 방향이 독립 커널과 달라서 옮길 때 다시 맞춰야 한다.</li>
+<li style="margin:4px 0;"><strong style="font-weight:700;">v0.5.19 cu129 빌드가 서버에서 도는지.</strong> CUDA 12.2 드라이버에서 torch와 Triton 커널이 정상 동작하는지 첫날 확인해야 한다.</li>
+<li style="margin:4px 0;"><strong style="font-weight:700;">시행 하나에 걸리는 시간.</strong> 이걸 재야 줄인 시행 계획의 GPU 시간을 확정할 수 있다.</li>
 <li style="margin:4px 0;">3%를 크게 넘으면 코드워드 나누기, 검사 위치 옮기기(타일 읽은 직후 대신 softmax 전), 워프 셔플 리덕션을 차례로 시도해 볼 생각이다.</li>
 </ul>
 <hr style="border:none;border-top:1px solid #ddd;margin:32px 0;" />
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">코드: <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">radixmend/kernels/secded_triton.py</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">tests/test_triton_kernels.py</code></p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">코드: <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">radixmend/kernels/secded_triton.py</code>, <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">tests/test_triton_kernels.py</code> 문서: <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">docs/sglang_v0519_diff.md</code>(버전 차이), <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">docs/experiment_spec.md</code> 5장 "축소 시행 계획"</p>
 </body></html>
