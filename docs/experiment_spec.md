@@ -6,13 +6,13 @@ GPU를 받기 전에 정할 수 있는 것을 정해 둔 문서다. GPU 실측�
 
 | 항목 | 값 | 근거 |
 |---|---|---|
-| GPU | NVIDIA RTX A6000 48GB (GDDR6, sm86), 하드웨어 ECC 꺼짐(기본값) | 기술서의 위협 모델. Rowhammer 실증 GPU |
-| 드라이버 | CUDA 13 지원 버전 **[GPU 확인]** | SGLang v0.5.22의 wheel이 cu13 기반(분석 노트 9장) |
-| SGLang | v0.5.22 (`baa9befa3`), 기간 중 고정 | 분석 노트 9장 |
+| GPU | NVIDIA RTX A6000 48GB (GDDR6, sm86), 하드웨어 ECC 꺼짐(기본값). 대학교 공용 서버(A6000 × 7, EPYC 7352, RAM 512GB, 개인 저장공간 50GB) 중 한 장 사용 | 기술서의 위협 모델. Rowhammer 실증 GPU |
+| 드라이버 | 서버 CUDA 12.2(드라이버 535 계열로 추정) **[GPU 확인]** | 드라이버를 올릴 수 없어 SGLang을 CUDA 12 빌드가 있는 버전으로 낮춤 |
+| SGLang | v0.5.19 (`0bcd82237`), cu129 빌드(torch 2.13.0), 기간 중 고정 | v0.5.20부터 CUDA 13 빌드만 있음. 달라진 점은 `docs/sglang_v0519_diff.md` |
 | 모델 | 주: Qwen3-8B, 보조: Llama-3-8B-Instruct. 둘 다 bf16, head_dim 128, KV head 8 | 선행 연구[1]가 Qwen3-8B를 사용해 재현 비교가 가능함 |
 | attention backend | `--attention-backend triton` (prefill, decode 모두) | in-repo Triton이라 패치 가능(분석 노트 5장) |
 | 고정 설정 | `--page-size 1 --tp-size 1 --kv-cache-dtype auto --kv-canary none`, speculative/HiCache/PD 끔, `--max-total-tokens` 고정 | 분석 노트 9장 |
-| 필수 env | `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` | Rust tree core는 노드에 접근할 수 없음 |
+| 필수 env | `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` | v0.5.19에서는 기본값이 python이지만 명시해 둔다. Rust tree core는 노드에 접근할 수 없음 |
 | 프로토타입 | `--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled`, 모듈 C는 `--disable-overlap-schedule`부터 | 분석 노트 9장 |
 | 최종 측정 | CUDA graph와 overlap은 기본값(켬). 끈 설정은 ablation으로 보고 | |
 | 샘플링 | greedy (temperature 0), 고정 seed | golden 출력과 비교하기 위해 |
@@ -107,23 +107,23 @@ GPU 시간을 줄이려고 위 절차의 시행 수를 아래로 줄인다. 원�
 
 ### 6.1 hit 시점 해시 [1]를 SGLang에 이식
 
-- 노드 KV가 완성되어 트리에 들어갈 때 노드 단위(page_size 1이면 노드 전체, 또는 고정 크기 블록 단위)로 SHA-256 digest를 계산해 노드에 저장한다. 계산은 GPU에서 KV를 바이트로 보고 해시한다. SGLang에 GPU SHA-256이 없으므로, CPU로 복사해 `hashlib`로 계산하는 버전(정확하지만 느림)과 GPU Adler-32(`kernels/ops/memory/adler32.py` 재사용, 빠름)를 둘 다 구현해 비용 비교에 쓴다.
+- 노드 KV가 완성되어 트리에 들어갈 때 노드 단위(page_size 1이면 노드 전체, 또는 고정 크기 블록 단위)로 SHA-256 digest를 계산해 노드에 저장한다. 계산은 GPU에서 KV를 바이트로 보고 해시한다. SGLang에 GPU SHA-256이 없으므로, CPU로 복사해 `hashlib`로 계산하는 버전(정확하지만 느림)과 GPU 해시(빠름)를 둘 다 구현해 비용 비교에 쓴다. v0.5.19에는 v0.5.22의 `kernels/ops/memory/adler32.py`가 없으므로, 그대로 들어 있는 `kernels/ops/memory/gpu_tensor_hash.py`(Triton, 64비트 비암호 해시)를 쓴다. 비교 결과를 v0.5.22 기준 설계와 맞추려면 adler32 Triton 커널을 radixmend 쪽으로 옮겨 오는 방법도 있다.
 - prefix 매칭에서 hit가 나면 매칭된 노드마다 digest를 다시 계산해 비교한다. 다르면 그 노드부터 아래를 버리고 재계산한다.
 - 삽입 위치는 Python tree core의 insert와 match 경로다(분석 노트 2, 8장).
 - 이 구현으로 보일 것: hit 시점 검증과 사용 시점 사이의 창(TOCTOU)에서 생기는 파생 오염을 막지 못한다는 것(RQ1 6단계).
 
 ### 6.2 하드웨어 ECC
 
-- A6000에서 `nvidia-smi -e 1` 후 재부팅하면 켜진다. 관리자 권한과 재부팅이 필요하다 **[GPU 확인: 서버 권한]**.
+- A6000에서 `nvidia-smi -e 1` 후 재부팅하면 켜진다. 관리자 권한과 재부팅이 필요하다. 대학교 공용 서버라 관리자에게 GPU 한 장만 일정을 잡아 바꿔 달라고 요청한다. 안 되면 이론값 비교로 대신한다 **[GPU 확인: 서버 권한]**.
 - 같은 워크로드로 가용 메모리(6.25% 감소 예상), 처리량, TPOT을 잰다.
 - 소프트웨어 주입은 ECC가 보호하는 DRAM을 거치지 않으므로, ECC의 교정·탐지 능력은 실측이 아니라 SECDED(72,64)의 이론값으로 비교한다. 이 한계는 보고서에 적는다.
 
 ## 7. GPU를 받은 날 확인할 것
 
-1. `nvidia-smi`: 드라이버 버전, CUDA 13 지원 여부, ECC 상태.
-2. SGLang v0.5.22 설치 후 Qwen3-8B를 `--attention-backend triton`으로 띄운다. 출력이 flashinfer 기본값과 같은지(greedy) 확인한다.
+1. `nvidia-smi`: 드라이버 버전과 ECC 상태. cu129 빌드의 torch에서 `torch.cuda.is_available()`이 되는지 확인한다.
+2. SGLang v0.5.19(cu129) 설치 후 Qwen3-8B를 `--attention-backend triton`으로 띄운다. 출력이 flashinfer 기본값과 같은지(greedy) 확인한다.
 3. `TRITON_INTERPRET` 없이 `pytest tests/`를 돌려 Triton 커널이 GPU에서도 통과하는지 본다.
-4. `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python`에서 처리량이 Rust core 대비 얼마나 떨어지는지 잰다. 차이가 크면 비용 측정의 기준선을 Python core로 통일한다.
+4. 개인 저장공간 50GB 안에 들어가는지 본다. 모델 두 개 약 32GB, 환경 8~10GB. pip 캐시는 끄고 `HF_HOME`은 공용 폴더가 있으면 거기로 잡는다. (v0.5.19는 Python tree core가 기본값이라 Rust 대비 비교는 하지 않는다.)
 5. 무결함 실행 두 번의 출력과 KV 차이를 잰다. 파생 오염 판정 임계값을 이 값으로 정한다.
 
 ## 참고
