@@ -18,7 +18,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_DIR="$CODE_DIR/results/env/$STAMP"
 
 mkdir -p "/tmp/$USER" && chmod 700 "/tmp/$USER"
-mkdir -p "$SCRATCH"/{hf,triton,tmp} "$LOG_DIR"
+mkdir -p "$SCRATCH"/{hf,triton,tmp,uv-cache} "$LOG_DIR"
 
 # 1) 셸 환경: 다음 로그인부터 자동 적용
 cat > "$HOME/.radixmend_env" <<ENV
@@ -28,16 +28,25 @@ export HF_HOME=$SCRATCH/hf
 export TRITON_CACHE_DIR=$SCRATCH/triton
 export TMPDIR=$SCRATCH/tmp
 export PIP_NO_CACHE_DIR=1
+export UV_CACHE_DIR=$SCRATCH/uv-cache
 export SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
-[ -f $VENV/bin/activate ] && source $VENV/bin/activate
+if [ -f $VENV/bin/activate ]; then source $VENV/bin/activate; fi
 ENV
 grep -q radixmend_env "$HOME/.bashrc" 2>/dev/null || echo '[ -f ~/.radixmend_env ] && source ~/.radixmend_env' >> "$HOME/.bashrc"
 # shellcheck disable=SC1090
 source "$HOME/.radixmend_env"
 
-# 2) venv (python3-venv가 없으면 virtualenv로 대체)
+# 2) venv: sglang 0.5.22 wheel은 Python 3.11~3.13만 있다 (시스템 python3는 3.10)
+PY="${PYTHON:-}"
+if [ -z "$PY" ]; then
+  for c in python3.12 python3.11 python3.13 /opt/anaconda3/bin/python3.11 /opt/anaconda3/bin/python3; do
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(not (3,11) <= sys.version_info[:2] <= (3,13))'; then PY="$c"; break; fi
+  done
+fi
+[ -n "$PY" ] || { echo "Python 3.11~3.13을 찾지 못함. PYTHON=/경로/python3.11 로 지정" >&2; exit 1; }
+echo "python: $PY ($("$PY" --version))"
 if [ ! -x "$VENV/bin/python" ]; then
-  python3 -m venv "$VENV" 2>/dev/null || { python3 -m pip install --user -q virtualenv && python3 -m virtualenv "$VENV"; }
+  "$PY" -m venv "$VENV" || { "$PY" -m pip install --user -q virtualenv && "$PY" -m virtualenv "$VENV"; }
 fi
 source "$VENV/bin/activate"
 python -m pip install -q -U pip uv
@@ -57,7 +66,7 @@ PY
 
 # 5) 모델 내려받기 (Llama는 HF_TOKEN 필요)
 for m in $MODELS; do
-  huggingface-cli download "$m" --exclude "*.pth" "original/*" >/dev/null
+  hf download "$m" --exclude "*.pth" --exclude "original/*" >/dev/null
   echo "downloaded $m"
 done
 
