@@ -196,7 +196,7 @@ def main() -> None:
     ap.add_argument("--cmd-dir", default=f"/tmp/{os.environ.get('USER', 'user')}/rm_cmd")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--kinds", default="v", help="v, k or k,v")
+    ap.add_argument("--kinds", default="v", help="v, k, k,v, or none (control: no flip)")
     ap.add_argument("--bits", default="0-15")
     ap.add_argument("--reps", type=int, default=50)
     ap.add_argument("--pos", default="prefix", help="prefix | sink | body | a:b")
@@ -255,8 +255,9 @@ def main() -> None:
             print("max-hours reached, stopping")
             break
         seed = int(hashlib.sha256(tid.encode()).hexdigest()[:8], 16)
-        inject = {"seed": seed, "kinds": [kind], "bits": [bit], "pos_lo": lo, "pos_hi": hi,
-                  "flips_per_vector": a.flips_per_vector}
+        # kind "none" is a control trial: same flow, faults sampled but not flipped
+        inject = {"seed": seed, "kinds": ["v" if kind == "none" else kind], "bits": [bit], "pos_lo": lo,
+                  "pos_hi": hi, "flips_per_vector": a.flips_per_vector, "dry_run": kind == "none"}
         rec = {"trial": tid, "kind": kind, "bit": bit, "rep": rep, "pos": a.pos, "golden_id": gid}
         try:
             outs, inj, _, secs = run_flow(a.url, cmd_dir, prompts, inject, a.warm_new, a.max_new)
