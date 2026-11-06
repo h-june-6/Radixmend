@@ -22,8 +22,6 @@ mkdir -p "$SCRATCH"/{hf,triton,tmp,uv-cache} "$LOG_DIR"
 
 # 1) 셸 환경: 다음 로그인부터 자동 적용
 cat > "$HOME/.radixmend_env" <<ENV
-export PATH=/usr/local/cuda-12.2/bin:\$PATH
-export CUDA_HOME=/usr/local/cuda-12.2
 export HF_HOME=$SCRATCH/hf
 export TRITON_CACHE_DIR=$SCRATCH/triton
 export TMPDIR=$SCRATCH/tmp
@@ -31,6 +29,10 @@ export PIP_NO_CACHE_DIR=1
 export UV_CACHE_DIR=$SCRATCH/uv-cache
 export SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
 if [ -f $VENV/bin/activate ]; then source $VENV/bin/activate; fi
+# JIT 커널(flashinfer, sglang KV 커널)은 venv의 CUDA 13 nvcc로 빌드한다.
+# 시스템 nvcc 12.2를 쓰면 flashinfer는 '--compress-mode' 오류로 죽고 triton KV 커널 빌드도 실패한다.
+CU13=$VENV/lib/python3.11/site-packages/nvidia/cu13
+if [ -x \$CU13/bin/nvcc ]; then export CUDA_HOME=\$CU13; export PATH=\$CU13/bin:\$PATH; fi
 ENV
 grep -q radixmend_env "$HOME/.bashrc" 2>/dev/null || echo '[ -f ~/.radixmend_env ] && source ~/.radixmend_env' >> "$HOME/.bashrc"
 # shellcheck disable=SC1090
@@ -53,6 +55,13 @@ python -m pip install -q -U pip uv
 
 # 3) SGLang (torch, triton 포함) + 연구 코드 의존성
 uv pip install "sglang[all]==$SGLANG_VERSION" pytest numpy huggingface_hub
+# nvcc/crt/nvvm은 런타임 헤더(13.0)와 맞춰 고정하고, JIT가 찾는 경로 링크를 만든다
+uv pip install "nvidia-cuda-nvcc==13.0.88" "nvidia-cuda-crt==13.0.88" "nvidia-nvvm==13.0.88"
+CU13="$(python -c 'import nvidia, os; print(os.path.join(list(nvidia.__path__)[0], "cu13"))')"
+[ -e "$CU13/lib64" ] || ln -s lib "$CU13/lib64"
+if [ ! -e "$CU13/lib/libcudart.so" ] && [ -e "$CU13/lib/libcudart.so.13" ]; then ln -s libcudart.so.13 "$CU13/lib/libcudart.so"; fi
+source "$HOME/.radixmend_env"
+nvcc --version | tail -1
 uv pip freeze > "$LOG_DIR/pip_freeze.txt"
 
 # 4) GPU 확인
@@ -74,7 +83,7 @@ done
 {
   echo "date: $(date -Is)"; echo "host: $(hostname)"; echo "sglang: $SGLANG_VERSION"
   nvidia-smi --query-gpu=index,name,uuid,driver_version,memory.total,ecc.mode.current --format=csv
-  nvcc --version | tail -1; uname -r; python --version
+  echo "nvcc: $(command -v nvcc)"; nvcc --version | tail -1; uname -r; python --version
   quota -s 2>/dev/null || true; df -h "$HOME" "$SCRATCH"
 } > "$LOG_DIR/system.txt" 2>&1
 cat "$LOG_DIR/system.txt"
