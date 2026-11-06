@@ -104,9 +104,9 @@ def build_prompts(tokenizer_name: str, n_followups: int):
     for q in questions[: n_followups + 1]:
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": q}]
         try:
-            ids = tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False)
+            ids = tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False, return_dict=False)
         except TypeError:
-            ids = tok.apply_chat_template(msgs, add_generation_prompt=True)
+            ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_dict=False)
         prompts.append(list(ids))
     shared = 0
     while all(len(p) > shared and p[shared] == prompts[0][shared] for p in prompts):
