@@ -74,3 +74,42 @@ def test_sweep_helpers():
     assert sweep.positions("sink", 900) == (0, 4) and sweep.positions("body", 900) == (4, 900)
     lo, hi = sweep.wilson(25, 50)
     assert 0.36 < lo < 0.37 and 0.63 < hi < 0.64
+
+
+def test_index_node_value_and_free_pages(tmp_path, monkeypatch):
+    monkeypatch.setenv("RADIXMEND_CMD_DIR", str(tmp_path))
+    sched, _ = fake_sched()
+    sched.token_to_kv_pool_allocator.free_pages = torch.arange(50, 64)
+    res = send(tmp_path, sched, {"op": "inject_index", "target": "node_value", "seed": 3, "bits": [0], "pos_lo": 0, "pos_hi": 20})
+    assert res["ok"] and res["new"] == res["old"] ^ 1
+    assert res["new_owner"] in ("same_node", "other_node", "free")
+    res = send(tmp_path, sched, {"op": "inject_index", "target": "free_pages", "seed": 3, "bits": [40]})
+    assert res["new_owner"] == "out_of_range"
+
+
+def test_index_deferred_waits_for_running_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("RADIXMEND_CMD_DIR", str(tmp_path))
+    sched, _ = fake_sched()
+    sched.running_batch = SimpleNamespace(reqs=[], seq_lens=torch.tensor([30]))
+    sched.req_to_token_pool = SimpleNamespace(req_to_token=torch.zeros(4, 40, dtype=torch.int32))
+    (tmp_path / "d.cmd.json").write_text(json.dumps({"op": "inject_index", "target": "seq_lens", "seed": 1, "bits": [2], "after_tokens": 3}))
+    hk._state["last_poll"] = 0.0
+    hk.poll(sched, tmp_path)
+    assert (tmp_path / "d.cmd.json").exists() and not (tmp_path / "d.done.json").exists()
+    req = SimpleNamespace(output_ids=[1, 2, 3], kv=SimpleNamespace(req_pool_idx=2))
+    sched.running_batch.reqs = [req]
+    hk._state["last_poll"] = 0.0
+    hk.poll(sched, tmp_path)
+    res = json.loads((tmp_path / "d.done.json").read_text())
+    assert res["ok"] and res["old"] == 30 and res["new"] == 26
+    res = send(tmp_path, sched, {"op": "inject_index", "target": "req_to_token", "seed": 1, "bits": [5], "pos_lo": 0, "pos_hi": 10, "after_tokens": 1})
+    assert res["row"] == 2 and res["new"] == 32
+
+
+def test_cancel(tmp_path, monkeypatch):
+    monkeypatch.setenv("RADIXMEND_CMD_DIR", str(tmp_path))
+    sched, _ = fake_sched()
+    sched.running_batch = None
+    (tmp_path / "p.cmd.json").write_text(json.dumps({"op": "inject_index", "target": "seq_lens", "seed": 1, "bits": [2]}))
+    res = send(tmp_path, sched, {"op": "cancel", "target_id": "p"})
+    assert res["cancelled"] and not (tmp_path / "p.cmd.json").exists()
