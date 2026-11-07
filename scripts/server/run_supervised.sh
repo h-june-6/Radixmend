@@ -13,10 +13,11 @@ export RADIXMEND_CMD_DIR="/tmp/$USER/rm_cmd"
 mkdir -p "$RADIXMEND_CMD_DIR"
 SERVER_ARGS=${SERVER_ARGS:-"--model-path Qwen/Qwen3-8B --attention-backend triton --page-size 1 --port 30000 --mem-fraction-static 0.85 --kv-canary none"}
 MAX_RESTARTS=${MAX_RESTARTS:-200}
+RUN_ID="$(date +%Y%m%d-%H%M%S)"  # 실행마다 로그 이름이 겹치지 않게
 
 start_server() {
   local n="$1"
-  python -m sglang.launch_server $SERVER_ARGS > "$LOG_DIR/server_$n.log" 2>&1 &
+  python -m sglang.launch_server $SERVER_ARGS > "$LOG_DIR/server_${RUN_ID}_$n.log" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 300); do
     curl -sf http://127.0.0.1:30000/health >/dev/null && return 0
@@ -39,7 +40,7 @@ stop_server() {
 for n in $(seq 0 "$MAX_RESTARTS"); do
   echo "[$(date -Is)] start server #$n" | tee -a "$LOG_DIR/supervisor.log"
   if ! start_server "$n"; then
-    echo "[$(date -Is)] server failed to start, see server_$n.log" | tee -a "$LOG_DIR/supervisor.log"
+    echo "[$(date -Is)] server failed to start, see server_${RUN_ID}_$n.log" | tee -a "$LOG_DIR/supervisor.log"
     stop_server; continue
   fi
   "$@" 2>&1 | tee -a "$LOG_DIR/driver.log"

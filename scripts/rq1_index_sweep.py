@@ -111,6 +111,12 @@ def trial(a, cmd_dir, prompts, shared, golden, target, group, seed):
 
 def summarize(out: Path) -> None:
     rows = [json.loads(l) for l in (out / "trials.jsonl").read_text().splitlines() if l.strip()]
+    # int64 targets: bits >= 32 can be dropped when the index is narrowed to int32
+    # (e.g. kv_indices), so the high group is reported as high<32 and high>=32
+    for r in rows:
+        bit = (r.get("inject") or {}).get("bit")
+        if r["group"] == "high" and bit is not None and r["target"] != "req_to_token":
+            r["group"] = "high>=32" if bit >= 32 else "high<32"
     keys = sorted({(r["target"], r["group"]) for r in rows})
     cols = ["crash", "error", "changed", "unchanged", "not_triggered"]
     lines = ["target,group,n," + ",".join(cols) + ",new_owner_counts"]
