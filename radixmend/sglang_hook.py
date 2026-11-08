@@ -29,6 +29,10 @@ Commands (field ``op``):
   slot owned by another part of the tree), ``same_node`` or ``free``.
   Index flips are not reverted: ``flush_cache`` rebuilds all of these.
 * ``cancel``     drop a pending command (field ``target_id``).
+* ``snapshot_kv`` / ``compare_kv`` (RQ1-6): follow ``tokens`` down the tree,
+  take the slots of positions ``[pos_lo, pos_hi)`` and save their K/V for all
+  layers to ``<cmd_dir>/<name>.pt`` / compare the current K/V with that file
+  (per-layer max abs difference and number of differing elements).
 
 Only TP size 1 is supported. Commands run between batches on the scheduler
 thread, followed by ``torch.cuda.synchronize()``.
@@ -186,6 +190,61 @@ def _op_inject_index(sched, cmd):
     raise ValueError(f"unknown index target {target}")
 
 
+def _path_slots(sched, tokens: list[int]) -> list[int]:
+    """KV slots of the longest cached prefix of ``tokens`` (walks the tree by key)."""
+    node = sched.tree_cache.tree_core.root_node
+    pos, slots = 0, []
+    while pos < len(tokens):
+        nxt = None
+        for c in node.children.values():
+            key = list(c.key.token_ids) if c.key is not None else []
+            if key and key[0] == tokens[pos]:
+                nxt, ckey = c, key
+                break
+        if nxt is None:
+            break
+        m = 0
+        while m < len(ckey) and pos + m < len(tokens) and ckey[m] == tokens[pos + m]:
+            m += 1
+        slots += fi.node_slots(nxt)[:m]
+        pos += m
+        if m < len(ckey):
+            break
+        node = nxt
+    return slots
+
+
+def _gather_kv(sched, cmd):
+    slots = _path_slots(sched, [int(t) for t in cmd["tokens"]])
+    lo, hi = int(cmd["pos_lo"]), int(cmd["pos_hi"])
+    if hi > len(slots):
+        raise RuntimeError(f"only {len(slots)} of the tokens are cached, need up to {hi}")
+    idx = torch.tensor(slots[lo:hi], dtype=torch.long, device=_kv_pool(sched).v_buffer[0].device)
+    pool = _kv_pool(sched)
+    k = torch.stack([b.index_select(0, idx) for b in pool.k_buffer])
+    v = torch.stack([b.index_select(0, idx) for b in pool.v_buffer])
+    return torch.stack([k, v], dim=1).cpu()  # [layers, 2, n, heads, dim]
+
+
+def _op_snapshot_kv(sched, cmd):
+    kv = _gather_kv(sched, cmd)
+    torch.save(kv, Path(os.environ["RADIXMEND_CMD_DIR"]) / f"{cmd['name']}.pt")
+    return {"tokens": int(kv.shape[2])}
+
+
+def _op_compare_kv(sched, cmd):
+    cur = _gather_kv(sched, cmd).float()
+    ref = torch.load(Path(os.environ["RADIXMEND_CMD_DIR"]) / f"{cmd['name']}.pt").float()
+    if ref.shape != cur.shape:
+        raise RuntimeError(f"shape mismatch {tuple(ref.shape)} vs {tuple(cur.shape)}")
+    d = (cur - ref).abs()
+    d = torch.nan_to_num(d, nan=float("inf"))
+    per_layer = d.amax(dim=(1, 2, 3, 4)).tolist()
+    per_token = (d.amax(dim=(0, 1, 3, 4)) > 0).tolist()
+    return {"max_abs_per_layer": per_layer, "max_abs": max(per_layer), "n_diff": int((d > 0).sum()),
+            "n_elems": int(d.numel()), "tokens_differing": int(sum(per_token)), "n_tokens": len(per_token)}
+
+
 def _op_cancel(sched, cmd):
     p = Path(os.environ["RADIXMEND_CMD_DIR"]) / f"{cmd['target_id']}.cmd.json"
     existed = p.exists()
@@ -194,7 +253,8 @@ def _op_cancel(sched, cmd):
 
 
 _OPS = {"tree_info": _op_tree_info, "inject_kv": _op_inject_kv, "revert": _op_revert,
-        "inject_index": _op_inject_index, "cancel": _op_cancel}
+        "inject_index": _op_inject_index, "cancel": _op_cancel,
+        "snapshot_kv": _op_snapshot_kv, "compare_kv": _op_compare_kv}
 
 
 def poll(sched, cmd_dir: Path) -> None:

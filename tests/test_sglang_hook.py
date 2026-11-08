@@ -113,3 +113,27 @@ def test_cancel(tmp_path, monkeypatch):
     (tmp_path / "p.cmd.json").write_text(json.dumps({"op": "inject_index", "target": "seq_lens", "seed": 1, "bits": [2]}))
     res = send(tmp_path, sched, {"op": "cancel", "target_id": "p"})
     assert res["cancelled"] and not (tmp_path / "p.cmd.json").exists()
+
+
+def test_snapshot_and_compare_follow_tree_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("RADIXMEND_CMD_DIR", str(tmp_path))
+    sched, pool = fake_sched()
+    root = sched.tree_cache.tree_core.root_node
+    parent = Node(torch.arange(10, 14))
+    parent.key = SimpleNamespace(token_ids=[1, 2, 3, 4])
+    child = Node(torch.arange(20, 23))
+    child.key = SimpleNamespace(token_ids=[5, 6, 7])
+    other = Node(torch.arange(30, 32))
+    other.key = SimpleNamespace(token_ids=[9, 9])
+    parent.children = {5: child, 9: other}
+    root.children = {1: parent}
+    assert hk._path_slots(sched, [1, 2, 3, 4, 5, 6, 8]) == [10, 11, 12, 13, 20, 21]
+    cmd = {"tokens": [1, 2, 3, 4, 5, 6, 7], "pos_lo": 4, "pos_hi": 7}
+    assert send(tmp_path, sched, {"op": "snapshot_kv", **cmd, "name": "g"})["tokens"] == 3
+    res = send(tmp_path, sched, {"op": "compare_kv", **cmd, "name": "g"})
+    assert res["n_diff"] == 0 and res["max_abs"] == 0
+    pool.v_buffer[2][21, 1, 3] += 1
+    res = send(tmp_path, sched, {"op": "compare_kv", **cmd, "name": "g"})
+    assert res["n_diff"] == 1 and res["tokens_differing"] == 1 and res["max_abs_per_layer"][2] > 0
+    res = send(tmp_path, sched, {"op": "compare_kv", **{**cmd, "pos_hi": 9}, "name": "g"})
+    assert not res["ok"] and "cached" in res["error"]
