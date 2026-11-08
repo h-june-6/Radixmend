@@ -258,9 +258,12 @@ def _op_secded_stats(sched, cmd):
     errs = ss.errors()
     if cmd.get("reset") and ss._state["err"] is not None:
         ss._state["err"].zero_()
-    return {"enabled": ss._state["err"] is not None,
-            "k_corrected": errs[0] if errs else 0, "k_uncorrectable": errs[1] if errs else 0,
-            "v_corrected": errs[2] if errs else 0, "v_uncorrectable": errs[3] if errs else 0}
+    errs = errs or [0] * 8
+    names = ["k_corrected", "k_uncorrectable", "v_corrected", "v_uncorrectable"]
+    out = {"enabled": ss._state["err"] is not None}
+    out.update({f"decode_{n}": errs[i] for i, n in enumerate(names)})
+    out.update({f"extend_{n}": errs[4 + i] for i, n in enumerate(names)})
+    return out
 
 
 _OPS = {"tree_info": _op_tree_info, "inject_kv": _op_inject_kv, "revert": _op_revert,

@@ -78,7 +78,7 @@ def test_single_bit_flips_are_corrected_bitwise(splits):
     v2.view(torch.int16)[s2, 0, 3] ^= 1 << 7
     fixed = run(q, k2, v2, kcw, vcw, indptr, idx, splits)
     assert torch.equal(clean[0], fixed[0]) and torch.equal(clean[1], fixed[1])
-    assert ss.errors() == [1, 0, 1, 0]
+    assert ss.errors()[:4] == [1, 0, 1, 0]
     # without the check the flip shows up in the output
     raw = run(q, k2, v2, kcw, vcw, indptr, idx, splits, check=False)
     assert not torch.equal(clean[0], raw[0])
@@ -94,3 +94,26 @@ def test_double_flip_is_counted_uncorrectable():
     k2.view(torch.int16)[s1, 0, 9] ^= 1 << 12
     run(q, k2, v, kcw, vcw, indptr, idx)
     assert ss.errors()[:2] == [0, 1]
+
+
+def test_prefix_check_fixes_in_place():
+    q, k, v, indptr, idx, _ = setup()
+    kcw, vcw = encode(k), encode(v)
+    ss._state["by_ptr"][k.data_ptr()] = (kcw, vcw)
+    clean_k, clean_v = k.clone(), v.clone()
+    ss._state["err"].zero_()
+    s1, s2, s3 = int(idx[3]), int(idx[90]), int(idx[100])
+    k.view(torch.int16)[s1, 0, 5] ^= 1 << 14
+    v.view(torch.int16)[s2, 1, 127] ^= 1 << 0
+    v.view(torch.int16)[s3, 1, 2] ^= 1 << 1  # double error: detected, left as is
+    v.view(torch.int16)[s3, 1, 60] ^= 1 << 9
+    # slot outside kv_indices[:indptr[-1]] is not touched
+    spare = torch.tensor(sorted(set(range(POOL)) - set(idx.tolist()))[:1], device=DEV)
+    k.view(torch.int16)[int(spare), 0, 0] ^= 1
+    padded = torch.cat([idx, spare])
+    assert ss.check_prefix(k, v, padded, indptr)
+    assert torch.equal(k[s1], clean_k[s1]) and torch.equal(v[s2], clean_v[s2])
+    assert not torch.equal(v[s3], clean_v[s3])
+    assert not torch.equal(k[int(spare)], clean_k[int(spare)])
+    assert ss.errors()[4:] == [1, 0, 1, 1]
+    del ss._state["by_ptr"][k.data_ptr()]

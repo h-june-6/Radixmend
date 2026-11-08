@@ -8,9 +8,12 @@ Scope of this prototype (enough to measure decode overhead, RQ3):
 * check-on-load: a copy of ``_fwd_grouped_kernel_stage1`` (GQA, page size 1,
   no MLA / score_mod / xai) that computes the syndrome of every K and V vector
   it loads and corrects single-bit errors in registers
-* error counters: [K corrected, K uncorrectable, V corrected, V uncorrectable]
-* NOT covered yet: extend (prefill) attention reads, scrub write-back,
-  MHA (kv_group_num == 1) decode path
+* check-before-extend: before the extend (prefill) attention reads a cached
+  prefix, a separate kernel checks every prefix slot of that layer and writes
+  corrected values back in place (scrub on read), so later reads are clean
+* error counters: decode [K corrected, K uncorrectable, V corrected, V uncorrectable]
+  then the same four for extend
+* NOT covered yet: MHA (kv_group_num == 1) decode path, page size > 1
 
 Syndrome math is the same code as ``radixmend.secded_vec`` but computed in the
 cheaper form: the in-element bit syndrome S_b and the overall parity only need
@@ -98,6 +101,31 @@ def _encode_scatter_kernel(buf_ptr, cw_ptr, loc_ptr, elab_ptr, bmask_ptr, stride
     q = _par16(se) ^ _par16(sb)
     cw = p | (se << 1) | (sb << (1 + E)) | (q << (1 + E + B))
     tl.store(cw_ptr + slot * H + h, cw.to(tl.int16))
+
+
+@triton.jit
+def _check_fix_inplace_kernel(buf_ptr, cw_ptr, loc_ptr, indptr_ptr, nb, elab_ptr, bmask_ptr, inv_e_ptr,
+                              inv_b_ptr, err_ptr, stride_s, stride_h, H, D: tl.constexpr, E: tl.constexpr,
+                              B: tl.constexpr):
+    """Check buf[loc[n], h] for n < indptr[nb]; fix single data-bit errors in place."""
+    n = tl.program_id(0)
+    h = tl.program_id(1)
+    total = tl.load(indptr_ptr + nb)
+    if n < total:
+        d = tl.arange(0, D)
+        slot = tl.load(loc_ptr + n).to(tl.int64)
+        ptr = buf_ptr + slot * stride_s + h * stride_h
+        x = tl.load(ptr + d).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+        p1, se1, sb1 = _syndrome(x, tl.load(elab_ptr + d), bmask_ptr, 0, B)
+        cw = tl.load(cw_ptr + slot * H + h).to(tl.int32) & 0xFFFF
+        st, el, bt = _status(p1, se1, sb1, cw, inv_e_ptr, inv_b_ptr, E, B)
+        if st == 1:
+            xe = tl.load(ptr + el).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+            fixed = (xe ^ (1 << bt)).to(tl.int16).to(buf_ptr.dtype.element_ty, bitcast=True)
+            tl.store(ptr + el, fixed)
+            tl.atomic_add(err_ptr + 0, 1)
+        if st == 3:
+            tl.atomic_add(err_ptr + 1, 1)
 
 
 # ---- decode stage 1 with check-on-load -------------------------------------------------
@@ -227,7 +255,7 @@ def _tables(device):
             inv_e=torch.tensor(inv_e, device=device),
             inv_b=torch.tensor(inv_b, device=device),
         )
-        _state["err"] = torch.zeros(4, dtype=torch.int32, device=device)
+        _state["err"] = torch.zeros(8, dtype=torch.int32, device=device)
     return _state["tables"]
 
 
@@ -284,6 +312,30 @@ def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr
     )
 
 
+def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int) -> None:
+    """Check the prefix slots kv_indices[:kv_indptr[-1]] of one layer buffer, fix in place."""
+    t = _tables(buf.device)
+    code = _state["code"]
+    n = kv_indices.numel()
+    if n == 0:
+        return
+    _check_fix_inplace_kernel[(n, buf.shape[1])](
+        buf, cw, kv_indices, kv_indptr, kv_indptr.numel() - 1, t["elab"], t["bmask"], t["inv_e"],
+        t["inv_b"], _state["err"][err_off:], buf.stride(0), buf.stride(1), buf.shape[1],
+        D=buf.shape[2], E=code.e_bits, B=code.b_bits,
+    )
+
+
+def check_prefix(k_buffer, v_buffer, kv_indices, kv_indptr) -> bool:
+    """Pre-extend check of a pool layer; False if the buffers are not a registered pool layer."""
+    cws = _state["by_ptr"].get(k_buffer.data_ptr())
+    if cws is None or k_buffer.dim() != 3:
+        return False
+    check_fix_inplace(k_buffer, cws[0], kv_indices, kv_indptr, 4)
+    check_fix_inplace(v_buffer, cws[1], kv_indices, kv_indptr, 6)
+    return True
+
+
 def errors() -> list[int]:
     return [] if _state["err"] is None else [int(x) for x in _state["err"].tolist()]
 
@@ -332,6 +384,28 @@ def install() -> None:
                       num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap, check,
                       block_h=da._GROUPED_BLOCK_H, min_block_kv=da._MIN_BLOCK_KV)
 
+    from sglang.kernels.ops.attention import extend_attention as ea
+
+    orig_ext = ea.extend_attention_fwd
+
+    def extend_attention_fwd(q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer, qo_indptr,
+                             kv_indptr, kv_indices, *args, **kwargs):
+        if check and kwargs.get("page_size", 1) == 1 and not kwargs.get("skip_prefix", False):
+            check_prefix(k_buffer, v_buffer, kv_indices, kv_indptr)
+        return orig_ext(q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer, qo_indptr,
+                        kv_indptr, kv_indices, *args, **kwargs)
+
+    orig_ext_u = ea.extend_attention_fwd_unified
+
+    def extend_attention_fwd_unified(q, o, k_buffer, v_buffer, k_scale, v_scale, qo_indptr, kv_indptr,
+                                     kv_indices, *args, **kwargs):
+        if check and kwargs.get("page_size", 1) == 1:
+            check_prefix(k_buffer, v_buffer, kv_indices, kv_indptr)
+        return orig_ext_u(q, o, k_buffer, v_buffer, k_scale, v_scale, qo_indptr, kv_indptr, kv_indices,
+                          *args, **kwargs)
+
+    ea.extend_attention_fwd = extend_attention_fwd
+    ea.extend_attention_fwd_unified = extend_attention_fwd_unified
     mp.MHATokenToKVPool.__init__ = __init__
     mp.MHATokenToKVPool.set_kv_buffer = set_kv_buffer
     da._decode_grouped_att_m_fwd = _decode_grouped_att_m_fwd

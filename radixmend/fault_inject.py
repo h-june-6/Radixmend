@@ -241,6 +241,13 @@ def append_log(path: str | Path, records: Iterable[FlipRecord], **meta) -> None:
             fh.write(json.dumps({**meta, **asdict(r)}) + "\n")
 
 
+def _set_raw(t: torch.Tensor, flat: int, raw: int) -> None:
+    # restore the saved value instead of flipping again: a protection module may
+    # already have corrected the element in place (scrub), and a second flip
+    # would then corrupt it
+    int_view(t).reshape(-1)[flat] = raw
+
+
 def revert(records: Sequence[FlipRecord], *, k_buffer=None, v_buffer=None, tensors=None) -> None:
     """Undo flips (in reverse order) so one model run can host many trials."""
     for r in reversed(records):
@@ -248,6 +255,6 @@ def revert(records: Sequence[FlipRecord], *, k_buffer=None, v_buffer=None, tenso
         if r.target == "kv":
             buf = (k_buffer if f["kind"] == "k" else v_buffer)[f["layer"]]
             _, heads, dim = buf.shape
-            flip_bits_(buf, [(f["slot"] * heads + f["head"]) * dim + f["elem"]], [f["bit"]])
+            _set_raw(buf, (f["slot"] * heads + f["head"]) * dim + f["elem"], r.old_raw)
         else:
-            flip_bits_(tensors[f["target"]], [f["flat_index"]], [f["bit"]])
+            _set_raw(tensors[f["target"]], f["flat_index"], r.old_raw)
