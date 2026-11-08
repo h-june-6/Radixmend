@@ -252,9 +252,21 @@ def _op_cancel(sched, cmd):
     return {"cancelled": existed}
 
 
+def _op_secded_stats(sched, cmd):
+    from radixmend import sglang_secded as ss
+
+    errs = ss.errors()
+    if cmd.get("reset") and ss._state["err"] is not None:
+        ss._state["err"].zero_()
+    return {"enabled": ss._state["err"] is not None,
+            "k_corrected": errs[0] if errs else 0, "k_uncorrectable": errs[1] if errs else 0,
+            "v_corrected": errs[2] if errs else 0, "v_uncorrectable": errs[3] if errs else 0}
+
+
 _OPS = {"tree_info": _op_tree_info, "inject_kv": _op_inject_kv, "revert": _op_revert,
         "inject_index": _op_inject_index, "cancel": _op_cancel,
-        "snapshot_kv": _op_snapshot_kv, "compare_kv": _op_compare_kv}
+        "snapshot_kv": _op_snapshot_kv, "compare_kv": _op_compare_kv,
+        "secded_stats": _op_secded_stats}
 
 
 def poll(sched, cmd_dir: Path) -> None:
