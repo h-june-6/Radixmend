@@ -16,6 +16,8 @@ SGLang radix tree KV 캐시의 비트플립을 attention 커널이 KV를 읽는 
 | `docs/secded_verification.md` | 검증 결과 요약과 설계 제안 |
 | `docs/sglang_code_analysis.md` | SGLang v0.5.22 코드 분석과 패치 지점 |
 | `docs/experiment_spec.md` | 실험 환경, 워크로드, 비교 절차 명세 |
+| `docs/server_runbook.md` | GPU 서버 대여 첫날 설치·확인부터 반납까지의 절차, 알려진 문제, 기준값 |
+| `scripts/server/` | 서버 설치(`setup.sh`), 첫날 확인(`day1.sh`), TPOT 측정(`bench_tpot.sh`), 작업 잇기(`after.sh`), 결과 회수(`pull_results.sh`) |
 
 ## 실행
 
