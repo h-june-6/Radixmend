@@ -31,12 +31,12 @@ def setup(seqs=(37, 70), splits=1, seed=0):
     return q, k, v, kv_indptr, kv_indices, seqs
 
 
-def run(q, k, v, kcw, vcw, kv_indptr, kv_indices, splits=1, check=True):
+def run(q, k, v, kcw, vcw, kv_indptr, kv_indices, splits=1, check=True, **kw):
     b, hq = q.shape[:2]
     out = torch.zeros(b, hq, splits, D, dtype=torch.float32, device=DEV)  # empty splits stay 0
     lse = torch.zeros(b, hq, splits, dtype=torch.float32, device=DEV)
     nsp = torch.full((b,), splits, dtype=torch.int32, device=DEV)
-    ss.launch_stage1(q, k, v, kcw, vcw, out, lse, kv_indptr, kv_indices, nsp, splits, D ** -0.5, 0.0, check)
+    ss.launch_stage1(q, k, v, kcw, vcw, out, lse, kv_indptr, kv_indices, nsp, splits, D ** -0.5, 0.0, check, **kw)
     return out, lse
 
 
@@ -99,7 +99,7 @@ def test_double_flip_is_counted_uncorrectable():
 def test_prefix_check_fixes_in_place():
     q, k, v, indptr, idx, _ = setup()
     kcw, vcw = encode(k), encode(v)
-    ss._state["by_ptr"][k.data_ptr()] = (kcw, vcw)
+    ss._state["by_ptr"][k.data_ptr()] = (kcw, vcw, 0)
     clean_k, clean_v = k.clone(), v.clone()
     ss._state["err"].zero_()
     s1, s2, s3 = int(idx[3]), int(idx[90]), int(idx[100])
@@ -117,3 +117,52 @@ def test_prefix_check_fixes_in_place():
     assert not torch.equal(k[int(spare)], clean_k[int(spare)])
     assert ss.errors()[4:] == [1, 0, 1, 1]
     del ss._state["by_ptr"][k.data_ptr()]
+
+
+# popc needs libdevice, so it only runs on the GPU
+VARIANTS = [dict(mode="full"), dict(mode="gate")] + (
+    [dict(mode="full", popc=True), dict(mode="gate", popc=True)] if torch.cuda.is_available() else [])
+
+
+@pytest.mark.parametrize("kw", VARIANTS, ids=lambda d: "-".join(f"{k}={v}" for k, v in d.items()))
+def test_variants_correct_single_flips(kw):
+    q, k, v, indptr, idx, _ = setup()
+    kcw, vcw = encode(k), encode(v)
+    clean = run(q, k, v, kcw, vcw, indptr, idx, 2, check=False)
+    assert torch.equal(clean[0], run(q, k, v, kcw, vcw, indptr, idx, 2, **kw)[0])
+    ss._state["err"].zero_()
+    k2, v2 = k.clone(), v.clone()
+    k2.view(torch.int16)[int(idx[5]), 1, 77] ^= 1 << 14
+    v2.view(torch.int16)[int(idx[50]), 0, 3] ^= 1 << 7
+    fixed = run(q, k2, v2, kcw, vcw, indptr, idx, 2, **kw)
+    assert torch.equal(clean[0], fixed[0]) and torch.equal(clean[1], fixed[1])
+    assert ss.errors()[:4] == [1, 0, 1, 0]
+
+
+def test_gate_misses_same_position_double_but_full_flags_it():
+    q, k, v, indptr, idx, _ = setup()
+    kcw, vcw = encode(k), encode(v)
+    k2 = k.clone()
+    s1 = int(idx[10])
+    k2.view(torch.int16)[s1, 0, 1] ^= 1 << 6
+    k2.view(torch.int16)[s1, 0, 9] ^= 1 << 6
+    ss._state["err"].zero_()
+    run(q, k2, v, kcw, vcw, indptr, idx, mode="gate")
+    assert ss.errors()[:2] == [0, 0]
+    run(q, k2, v, kcw, vcw, indptr, idx, mode="full")
+    assert ss.errors()[:2] == [0, 1]
+
+
+def test_sample_checks_each_tile_once_per_period():
+    q, k, v, indptr, idx, seqs = setup()
+    kcw, vcw = encode(k), encode(v)
+    k2 = k.clone()
+    k2.view(torch.int16)[int(idx[5]), 1, 77] ^= 1 << 14  # tile 0 of request 0
+    P = 3
+    hits = []
+    for step in range(P):
+        ss._state["phase"].fill_(step)
+        ss._state["err"].zero_()
+        run(q, k2, v, kcw, vcw, indptr, idx, sample=P)
+        hits.append(ss.errors()[0])
+    assert sorted(hits) == [0, 0, 1]

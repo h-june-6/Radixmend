@@ -60,7 +60,7 @@ tmux new -d -s q2 "bash ~/radixmend/scripts/server/after.sh drv -- bash scripts/
 
 - 구성은 이름 또는 `이름:VAR=값,...` 이다. 구성마다 `RADIXMEND_*`를 모두 지우고 다시 정하므로 서로 섞이지 않는다.
   - `nosecded`, `encode`(`RADIXMEND_SECDED=1 RADIXMEND_SECDED_CHECK=0`), `check`(`RADIXMEND_SECDED=1`)
-  - 예: `gate:RADIXMEND_SECDED=1,RADIXMEND_SECDED_MODE=gate`, `sample10:RADIXMEND_SECDED=1,RADIXMEND_SECDED_MODE=sample,RADIXMEND_SECDED_SAMPLE=0.1`
+  - 예: `gate:RADIXMEND_SECDED=1,RADIXMEND_SECDED_MODE=gate`, `s4:RADIXMEND_SECDED=1,RADIXMEND_SECDED_MODE=gate,RADIXMEND_SECDED_SAMPLE=4`
   - 구성별로 실제 쓴 변수가 `<결과>/<구성>/config.env`에 남는다.
 - `PROFILE=reduced`(기본, 구성당 약 55분) / `full`(약 2.2시간) / `smoke`(약 3분, 스크립트 확인용)
 - `KERNEL_BENCH=1`이면 서버 측정 전에 `scripts/bench_fused_decode.py --out results/rq3/fused_kernel.json`을 먼저 돈다.

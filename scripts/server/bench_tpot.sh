@@ -8,7 +8,7 @@
 #   예: tmux new -d -s tpot "bash ~/radixmend/scripts/server/bench_tpot.sh results/rq3/tpot_$(date +%m%d) \
 #         nosecded encode check \
 #         gate:RADIXMEND_SECDED=1,RADIXMEND_SECDED_MODE=gate \
-#         sample10:RADIXMEND_SECDED=1,RADIXMEND_SECDED_MODE=sample,RADIXMEND_SECDED_SAMPLE=0.1"
+#         s4:RADIXMEND_SECDED=1,RADIXMEND_SECDED_MODE=gate,RADIXMEND_SECDED_SAMPLE=4"
 # KERNEL_BENCH=1 이면 서버 측정 전에 커널 마이크로벤치를 먼저 돈다
 #   (python scripts/bench_fused_decode.py --out ${KERNEL_BENCH_OUT:-results/rq3/fused_kernel.json})
 # 프로파일 (PROFILE 환경 변수):
