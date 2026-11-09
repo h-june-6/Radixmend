@@ -185,6 +185,109 @@ def _check_fix_inplace_kernel(buf_ptr, cw_ptr, loc_ptr, indptr_ptr, nb, elab_ptr
 
 
 @triton.jit
+def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_kv_start, split_kv_end,
+           cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d, mask_dv,
+           stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr, bmask_ptr, inv_e_ptr,
+           inv_b_ptr, phase_ptr, BLOCK_N: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+           BLOCK_DV: tl.constexpr,
+           logit_cap: tl.constexpr, E: tl.constexpr, B: tl.constexpr, TM: tl.constexpr,
+           POPC: tl.constexpr, SAMPLE: tl.constexpr):
+    """Attention over one KV split. TM: 0 no check, 1 full, 2 gate, 3 signature (no correction).
+
+    TM 3 only accumulates, element-wise, the XOR of every K and V word and of the
+    stored checkwords; one reduction at the end compares the parity / bit
+    syndrome of the total. Any odd number of flipped bits in the split shows up
+    (p changes); even-weight patterns whose bit labels cancel are missed. The
+    caller redoes the split with TM 1 when ``bad`` is set.
+    """
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+    base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
+    base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
+    nk_fix = tl.sum(mask_h.to(tl.int32), 0) * 0
+    nk_bad = nk_fix
+    nv_fix = nk_fix
+    nv_bad = nk_fix
+    bad = nk_fix
+    if TM == 1 or TM == 2:
+        elab_k = tl.load(elab_ptr + offs_d)[:, None]
+        elab_v = tl.load(elab_ptr + offs_dv)[None, :]
+        if SAMPLE > 1:
+            phase = tl.load(phase_ptr)
+    if TM == 3:
+        xk_acc = tl.zeros([BLOCK_DMODEL, BLOCK_N], dtype=tl.int16)
+        xv_acc = tl.zeros([BLOCK_N, BLOCK_DV], dtype=tl.int16)
+        ck_acc = tl.zeros([BLOCK_N], dtype=tl.int16)
+        cv_acc = tl.zeros([BLOCK_N], dtype=tl.int16)
+    for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < split_kv_end
+        kv_loc = tl.load(kv_indices + kv_start_idx + offs_n, mask=mask_n, other=0)
+        offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
+        k = tl.load(K_Buffer + offs_buf_k, mask=mask_n[None, :] & (mask_d[:, None]), other=0.0)
+        if TM == 3:
+            xk_acc = xk_acc ^ k.to(tl.int16, bitcast=True)
+            ck_acc = ck_acc ^ tl.load(K_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0)
+        if TM == 1 or TM == 2:
+            do_k = True
+            if SAMPLE > 1:
+                # check each tile once every SAMPLE decode steps (rotating phase)
+                do_k = ((start_n // BLOCK_N + phase) % SAMPLE) == 0
+            if do_k:
+                cwk = tl.load(K_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0).to(tl.int32) & 0xFFFF
+                fk, a, b_ = _check_tile(k.to(tl.int16, bitcast=True), cwk, mask_n, offs_d[:, None], elab_k,
+                                        bmask_ptr, inv_e_ptr, inv_b_ptr, 0, E, B, TM == 2, POPC)
+                if a + b_ > 0:
+                    k = (k.to(tl.int16, bitcast=True).to(tl.int32) ^ fk).to(tl.int16).to(
+                        K_Buffer.dtype.element_ty, bitcast=True)
+                    nk_fix += a
+                    nk_bad += b_
+        qk = tl.dot(q_k, k)
+        qk *= sm_scale_withk
+        if logit_cap > 0:
+            qk = logit_cap * tl.extra.cuda.libdevice.tanh(qk / logit_cap)
+        qk = tl.where(mask_h[:, None] & mask_n[None, :], qk, float("-inf"))
+        offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+        v = tl.load(V_Buffer + offs_buf_v, mask=mask_n[:, None] & (mask_dv[None, :]), other=0.0)
+        if TM == 3:
+            xv_acc = xv_acc ^ v.to(tl.int16, bitcast=True)
+            cv_acc = cv_acc ^ tl.load(V_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0)
+        if TM == 1 or TM == 2:
+            if do_k:
+                cwv = tl.load(V_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0).to(tl.int32) & 0xFFFF
+                fv, a, b_ = _check_tile(v.to(tl.int16, bitcast=True), cwv, mask_n, offs_dv[None, :], elab_v,
+                                        bmask_ptr, inv_e_ptr, inv_b_ptr, 1, E, B, TM == 2, POPC)
+                if a + b_ > 0:
+                    v = (v.to(tl.int16, bitcast=True).to(tl.int32) ^ fv).to(tl.int16).to(
+                        V_Buffer.dtype.element_ty, bitcast=True)
+                    nv_fix += a
+                    nv_bad += b_
+        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
+        acc *= re_scale[:, None]
+        acc += tl.dot(p.to(v.dtype), v)
+        e_sum = e_sum * re_scale + tl.sum(p, 1)
+        e_max = n_e_max
+    if TM == 3:
+        bad = _sig_bad(xk_acc, ck_acc, bmask_ptr, E, B) | _sig_bad(xv_acc, cv_acc, bmask_ptr, E, B)
+    return acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad
+
+
+@triton.jit
+def _sig_bad(x_acc, c_acc, bmask_ptr, E: tl.constexpr, B: tl.constexpr):
+    """1 if the (p, S_b) signature of the XOR of all words differs from the stored one."""
+    c = tl.reduce(tl.reduce(x_acc, 1, _xor), 0, _xor).to(tl.int32) & 0xFFFF
+    cw = tl.reduce(c_acc, 0, _xor).to(tl.int32) & 0xFFFF
+    p1 = _par16(c)
+    sb1 = _sb_of(c, bmask_ptr, B)
+    p0 = cw & 1
+    sb0 = (cw >> (1 + E)) & ((1 << B) - 1)
+    return ((p1 != p0) | (sb1 != sb0)).to(tl.int32)
+
+
+@triton.jit
 def _fwd_grouped_kernel_stage1_secded(
     Q, K_Buffer, V_Buffer, K_CW, V_CW, sm_scale_withk, kv_indptr, kv_indices, Att_Out, Att_Lse,
     num_kv_splits, elab_ptr, bmask_ptr, inv_e_ptr, inv_b_ptr, err_ptr,
@@ -194,7 +297,7 @@ def _fwd_grouped_kernel_stage1_secded(
     BLOCK_DV: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_H: tl.constexpr, MIN_BLOCK_KV: tl.constexpr,
     logit_cap: tl.constexpr, Lk: tl.constexpr, Lv: tl.constexpr, E: tl.constexpr, B: tl.constexpr,
     CHECK: tl.constexpr, GATE: tl.constexpr = False, POPC: tl.constexpr = False,
-    SAMPLE: tl.constexpr = 1, phase_ptr=None,
+    SAMPLE: tl.constexpr = 1, phase_ptr=None, SIG: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0).to(tl.int64)
     cur_head_id = tl.program_id(1)
@@ -218,68 +321,33 @@ def _fwd_grouped_kernel_stage1_secded(
     kv_len_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
-    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
-    base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
-    base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
-    if CHECK:
-        elab_k = tl.load(elab_ptr + offs_d)[:, None]
-        elab_v = tl.load(elab_ptr + offs_dv)[None, :]
-        nk_fix = 0
-        nk_bad = 0
-        nv_fix = 0
-        nv_bad = 0
-        if SAMPLE > 1:
-            phase = tl.load(phase_ptr)
-
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
         q_k = q.to(K_Buffer.dtype.element_ty)
-        for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
-            offs_n = start_n + tl.arange(0, BLOCK_N)
-            mask_n = offs_n < split_kv_end
-            kv_loc = tl.load(kv_indices + cur_batch_kv_start_idx + offs_n, mask=mask_n, other=0)
-            offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
-            k = tl.load(K_Buffer + offs_buf_k, mask=mask_n[None, :] & (mask_d[:, None]), other=0.0)
-            if CHECK:
-                do_k = True
-                if SAMPLE > 1:
-                    # check each tile once every SAMPLE decode steps (rotating phase)
-                    do_k = ((start_n // BLOCK_N + phase) % SAMPLE) == 0
-                if do_k:
-                    cwk = tl.load(K_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0).to(tl.int32) & 0xFFFF
-                    fk, a, b_ = _check_tile(k.to(tl.int16, bitcast=True), cwk, mask_n, offs_d[:, None], elab_k,
-                                            bmask_ptr, inv_e_ptr, inv_b_ptr, 0, E, B, GATE, POPC)
-                    if a + b_ > 0:
-                        k = (k.to(tl.int16, bitcast=True).to(tl.int32) ^ fk).to(tl.int16).to(
-                            K_Buffer.dtype.element_ty, bitcast=True)
-                        nk_fix += a
-                        nk_bad += b_
-            qk = tl.dot(q_k, k)
-            qk *= sm_scale_withk
-            if logit_cap > 0:
-                qk = logit_cap * tl.extra.cuda.libdevice.tanh(qk / logit_cap)
-            qk = tl.where(mask_h[:, None] & mask_n[None, :], qk, float("-inf"))
-            offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
-            v = tl.load(V_Buffer + offs_buf_v, mask=mask_n[:, None] & (mask_dv[None, :]), other=0.0)
-            if CHECK:
-                if do_k:
-                    cwv = tl.load(V_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0).to(tl.int32) & 0xFFFF
-                    fv, a, b_ = _check_tile(v.to(tl.int16, bitcast=True), cwv, mask_n, offs_dv[None, :], elab_v,
-                                            bmask_ptr, inv_e_ptr, inv_b_ptr, 1, E, B, GATE, POPC)
-                    if a + b_ > 0:
-                        v = (v.to(tl.int16, bitcast=True).to(tl.int32) ^ fv).to(tl.int16).to(
-                            V_Buffer.dtype.element_ty, bitcast=True)
-                        nv_fix += a
-                        nv_bad += b_
-            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
-            e_sum = e_sum * re_scale + tl.sum(p, 1)
-            e_max = n_e_max
+        if not CHECK:
+            TM: tl.constexpr = 0
+        elif SIG:
+            TM: tl.constexpr = 3
+        elif GATE:
+            TM: tl.constexpr = 2
+        else:
+            TM: tl.constexpr = 1
+        acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad = _split(
+            q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, cur_batch_kv_start_idx, split_kv_start,
+            split_kv_end, cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d, mask_dv,
+            stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr, bmask_ptr, inv_e_ptr,
+            inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B, TM, POPC, SAMPLE)
+        if SIG:
+            if bad > 0:
+                # optimistic pass saw a signature mismatch somewhere in this split: redo it
+                # with the full per-vector check and correction
+                acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad = _split(
+                    q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, cur_batch_kv_start_idx, split_kv_start,
+                    split_kv_end, cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d,
+                    mask_dv, stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr,
+                    bmask_ptr, inv_e_ptr, inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B,
+                    1, POPC, 1)
+                tl.atomic_add(err_ptr + 8, 1)
 
         offs_mid_o = (cur_batch * stride_mid_ob + cur_head[:, None] * stride_mid_oh
                       + split_kv_id * stride_mid_os + offs_dv[None, :])
@@ -313,7 +381,7 @@ def _tables(device):
             inv_e=torch.tensor(inv_e, device=device),
             inv_b=torch.tensor(inv_b, device=device),
         )
-        _state["err"] = torch.zeros(8, dtype=torch.int32, device=device)
+        _state["err"] = torch.zeros(9, dtype=torch.int32, device=device)  # [8] = sig redo count
         _state["phase"] = torch.zeros(1, dtype=torch.int32, device=device)
     return _state["tables"]
 
@@ -367,9 +435,9 @@ def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr
         kv_group_num=kv_group_num, q_head_num=head_num, BLOCK_DMODEL=triton.next_power_of_2(Lk),
         BLOCK_DV=triton.next_power_of_2(Lv), BLOCK_N=32, BLOCK_H=block_h,
         MIN_BLOCK_KV=min_block_kv, logit_cap=logit_cap, Lk=Lk, Lv=Lv,
-        E=code.e_bits, B=code.b_bits, CHECK=check, GATE=(mode == "gate"),
+        E=code.e_bits, B=code.b_bits, CHECK=check, GATE=(mode == "gate"), SIG=(mode == "sig"),
         POPC=(k_buffer.is_cuda if popc is None else popc), SAMPLE=sample,
-        phase_ptr=_state["phase"] if sample > 1 else None, num_warps=4, num_stages=2,
+        phase_ptr=_state["phase"], num_warps=4, num_stages=2,
     )
 
 
@@ -411,10 +479,11 @@ def install() -> None:
         return
     check = os.environ.get("RADIXMEND_SECDED_CHECK", "1") == "1"
     # decode check variant: full (every tile, full syndrome), gate (parity/bit-syndrome
-    # gate before the element syndrome); RADIXMEND_SECDED_SAMPLE=P checks each tile
+    # gate before the element syndrome), sig (one signature per split, redo the split
+    # with the full check on mismatch); RADIXMEND_SECDED_SAMPLE=P checks each tile
     # once every P decode steps. Extend always runs the full check.
     mode = os.environ.get("RADIXMEND_SECDED_MODE", "full")
-    assert mode in ("full", "gate"), mode
+    assert mode in ("full", "gate", "sig"), mode
     sample = int(os.environ.get("RADIXMEND_SECDED_SAMPLE", "1"))
     popc = {"1": True, "0": False}.get(os.environ.get("RADIXMEND_SECDED_POPC", ""), None)
 

@@ -258,11 +258,12 @@ def _op_secded_stats(sched, cmd):
     errs = ss.errors()
     if cmd.get("reset") and ss._state["err"] is not None:
         ss._state["err"].zero_()
-    errs = errs or [0] * 8
+    errs = (errs or []) + [0] * (9 - len(errs or []))
     names = ["k_corrected", "k_uncorrectable", "v_corrected", "v_uncorrectable"]
     out = {"enabled": ss._state["err"] is not None}
     out.update({f"decode_{n}": errs[i] for i, n in enumerate(names)})
     out.update({f"extend_{n}": errs[4 + i] for i, n in enumerate(names)})
+    out["sig_redo_splits"] = errs[8]
     return out
 
 

@@ -115,12 +115,12 @@ def test_prefix_check_fixes_in_place():
     assert torch.equal(k[s1], clean_k[s1]) and torch.equal(v[s2], clean_v[s2])
     assert not torch.equal(v[s3], clean_v[s3])
     assert not torch.equal(k[int(spare)], clean_k[int(spare)])
-    assert ss.errors()[4:] == [1, 0, 1, 1]
+    assert ss.errors()[4:8] == [1, 0, 1, 1]
     del ss._state["by_ptr"][k.data_ptr()]
 
 
 # popc needs libdevice, so it only runs on the GPU
-VARIANTS = [dict(mode="full"), dict(mode="gate")] + (
+VARIANTS = [dict(mode="full"), dict(mode="gate"), dict(mode="sig")] + (
     [dict(mode="full", popc=True), dict(mode="gate", popc=True)] if torch.cuda.is_available() else [])
 
 
@@ -166,3 +166,16 @@ def test_sample_checks_each_tile_once_per_period():
         run(q, k2, v, kcw, vcw, indptr, idx, sample=P)
         hits.append(ss.errors()[0])
     assert sorted(hits) == [0, 0, 1]
+
+
+def test_sig_redoes_only_bad_splits():
+    q, k, v, indptr, idx, _ = setup()
+    kcw, vcw = encode(k), encode(v)
+    ss._state["err"].zero_()
+    run(q, k, v, kcw, vcw, indptr, idx, 3, mode="sig")
+    assert ss.errors()[8] == 0
+    v2 = v.clone()
+    v2.view(torch.int16)[int(idx[50]), 0, 3] ^= 1 << 7  # request 1, one split
+    run(q, k, v2, kcw, vcw, indptr, idx, 3, mode="sig")
+    e = ss.errors()
+    assert e[8] == 1 and e[2] == 1

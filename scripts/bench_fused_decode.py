@@ -30,6 +30,7 @@ VARIANTS = {
     "gate_popc": dict(mode="gate", popc=True),
     "full_popc_s4": dict(mode="full", popc=True, sample=4),
     "gate_popc_s4": dict(mode="gate", popc=True, sample=4),
+    "sig": dict(mode="sig", popc=True),
 }
 
 
