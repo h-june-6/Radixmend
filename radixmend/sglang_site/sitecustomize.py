@@ -3,7 +3,8 @@
 Installs the RadixMend fault-injection hook in every SGLang process
 (including the spawned scheduler) when RADIXMEND_CMD_DIR is set, and the
 module A prototype (SECDED check inside triton decode attention) when
-RADIXMEND_SECDED=1. Does nothing otherwise.
+RADIXMEND_SECDED=1, and the hit-time hash baseline when RADIXMEND_HASH=1.
+Does nothing otherwise.
 """
 import os
 import sys
@@ -23,3 +24,11 @@ if os.environ.get("RADIXMEND_SECDED") == "1":
         secded_install()
     except Exception as e:
         print(f"[radixmend] secded not installed: {e!r}", file=sys.stderr)
+
+if os.environ.get("RADIXMEND_HASH") == "1":
+    try:
+        from radixmend.sglang_hash import install as hash_install
+
+        hash_install()
+    except Exception as e:
+        print(f"[radixmend] hash baseline not installed: {e!r}", file=sys.stderr)

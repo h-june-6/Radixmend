@@ -13,8 +13,18 @@ contamination when the child K/V differs from golden after step 4, and the
 damage persists when turn 2 differs too, even though the parent is clean.
 ``--kinds none`` runs controls (no flip) that must show zero difference.
 
+``--when decode`` moves the flip to after the prefix hit: it is injected while
+turn 1 is decoding (``--after-tokens``), so a hit-time hash (server started
+with RADIXMEND_HASH=1) has already passed the parent. The child range then
+also covers turn 1's generated tokens, whose KV was computed from the flipped
+parent. Hash and SECDED counters are recorded per trial when the server has
+them.
+
     python scripts/rq1_derived.py --out results/rq1/derived --kinds v --bits 14,7 --reps 30
     python scripts/rq1_derived.py --out results/rq1/derived --kinds none --bits 0 --reps 10
+    # hash baseline (server with RADIXMEND_HASH=1): flip before the hit, then after it
+    python scripts/rq1_derived.py --out results/rq1/derived_hash --kinds v --bits 14,7 --reps 30
+    python scripts/rq1_derived.py --out results/rq1/derived_hash_toctou --when decode --kinds v --bits 14,7 --reps 30
 """
 
 from __future__ import annotations
@@ -41,7 +51,7 @@ def chat_ids(tok, msgs):
 
 
 def flow(a, cmd_dir, tok, system, q0, q1, inject, golden=None):
-    """Returns (turn1_out, turn2_out, kv_compare or None, flips)."""
+    """Returns (turn1_out, turn2_out, kv_compare or None, flips, shared, len(p1), answer, stats)."""
     sys_msgs = [{"role": "system", "content": system}]
     p0 = chat_ids(tok, sys_msgs + [{"role": "user", "content": q0}])
     p1 = chat_ids(tok, sys_msgs + [{"role": "user", "content": q1}])
@@ -50,23 +60,64 @@ def flow(a, cmd_dir, tok, system, q0, q1, inject, golden=None):
         shared += 1
     kv.flush(a.url)
     kv.generate(a.url, p0, a.warm_new)
-    inj = kv.hook(cmd_dir, {"op": "inject_kv", **inject, "pos_lo": 0, "pos_hi": shared})
+    stats = {op: kv.hook(cmd_dir, {"op": op, "reset": True}) for op in ("hash_stats", "secded_stats")}
+    op = {"op": "inject_kv", **inject, "pos_lo": 0, "pos_hi": shared}
     try:
-        out1 = kv.generate(a.url, p1, a.max_new)
+        if a.when == "decode":
+            op["after_tokens"] = a.after_tokens
+            cid = send_cmd(cmd_dir, op)
+            out1 = kv.generate(a.url, p1, a.max_new)
+            inj = wait_done(cmd_dir, cid, 5.0)
+            if inj is None:
+                kv.hook(cmd_dir, {"op": "cancel", "target_id": cid})
+                inj = {"flips": [], "not_triggered": True}
+            elif not inj.get("ok", True):
+                raise RuntimeError(inj.get("error"))
+        else:
+            inj = kv.hook(cmd_dir, op)
+            out1 = kv.generate(a.url, p1, a.max_new)
     finally:
         kv.hook(cmd_dir, {"op": "revert"})
-    child = {"tokens": p1, "pos_lo": shared, "pos_hi": len(p1)}
+    stats = {op: kv.hook(cmd_dir, {"op": op}) for op in ("hash_stats", "secded_stats")}
+    # child = turn 1's own tokens; with a decode-time flip also its generated tokens
+    # (the last output token has no KV yet)
+    gen = out1 if a.when == "decode" else []
+    child = {"tokens": p1 + gen, "pos_lo": shared, "pos_hi": len(p1) + max(len(gen) - 1, 0)}
     if golden is None:
         kv.hook(cmd_dir, {"op": "snapshot_kv", **child, "name": "derived_golden"})
         cmp = None
         answer = tok.decode(out1, skip_special_tokens=True)
     else:
-        cmp = kv.hook(cmd_dir, {"op": "compare_kv", **child, "name": "derived_golden"})
+        if out1 == golden["out1"]:
+            cmp = kv.hook(cmd_dir, {"op": "compare_kv", **child, "name": "derived_golden"})
+        else:  # turn 1 tokens diverged: the child is a different sequence
+            cmp = {"diverged": True, "n_diff": -1, "max_abs": float("nan")}
         answer = golden["answer"]
     p2 = chat_ids(tok, sys_msgs + [{"role": "user", "content": q1}, {"role": "assistant", "content": answer},
                                    {"role": "user", "content": FOLLOW_UP}])
     out2 = kv.generate(a.url, p2, a.max_new)
-    return out1, out2, cmp, inj["flips"], shared, len(p1), answer
+    stats2 = {op: kv.hook(cmd_dir, {"op": op}) for op in ("hash_stats", "secded_stats")}
+    return out1, out2, cmp, inj.get("flips", []), shared, len(p1), answer, {"turn1": stats, "after_turn2": stats2}
+
+
+def send_cmd(cmd_dir: Path, op: dict) -> str:
+    cid = f"{time.time_ns()}"
+    tmp = cmd_dir / f"{cid}.tmp"
+    tmp.write_text(json.dumps(op))
+    os.replace(tmp, cmd_dir / f"{cid}.cmd.json")
+    return cid
+
+
+def wait_done(cmd_dir: Path, cid: str, timeout: float):
+    done = cmd_dir / f"{cid}.done.json"
+    t0 = time.monotonic()
+    while not done.exists():
+        if time.monotonic() - t0 > timeout:
+            return None
+        time.sleep(0.005)
+    res = json.loads(done.read_text())
+    done.unlink()
+    return res
 
 
 def main() -> None:
@@ -80,6 +131,9 @@ def main() -> None:
     ap.add_argument("--reps", type=int, default=30)
     ap.add_argument("--warm-new", type=int, default=16)
     ap.add_argument("--max-new", type=int, default=64)
+    ap.add_argument("--when", choices=["hit", "decode"], default="hit",
+                    help="flip before turn 1 (hit) or while turn 1 decodes, after the hit check (decode)")
+    ap.add_argument("--after-tokens", type=int, default=4)
     ap.add_argument("--summarize", action="store_true")
     a = ap.parse_args()
     out = Path(a.out)
@@ -91,7 +145,7 @@ def main() -> None:
         for k, b in keys:
             rs = [r for r in rows if r["kind"] == k and r["bit"] == b and not r.get("error")]
             kvd = [r for r in rs if r["child_kv_differs"]]
-            mx = sorted(r["kv"]["max_abs"] for r in rs)
+            mx = sorted(r["kv"]["max_abs"] for r in rs if r["kv"]["max_abs"] == r["kv"]["max_abs"])
             print(f"{k},{b},{len(rs)},{len(kvd)},{sum(r['turn1_changed'] for r in rs)},"
                   f"{sum(r['turn2_changed'] for r in rs)},{sum(r['turn2_changed'] for r in kvd)},"
                   f"{mx[len(mx)//2] if mx else 0:.3g}")
@@ -114,7 +168,9 @@ def main() -> None:
     if g2[0] != g[0] or g2[1] != g[1] or g2[2]["n_diff"]:
         print("golden not reproducible:", g2[2])
         sys.exit(2)
-    print(f"golden ok: shared {g[4]}, child prompt tokens {g[5] - g[4]}", flush=True)
+    print(f"golden ok: shared {g[4]}, child prompt tokens {g[5] - g[4]}, when={a.when}, "
+          f"hash={g[7]['turn1']['hash_stats'].get('enabled')}, secded={g[7]['turn1']['secded_stats'].get('enabled')}",
+          flush=True)
 
     done = set()
     if tpath.exists():
@@ -130,8 +186,8 @@ def main() -> None:
         rec = {"trial": tid, "kind": kind, "bit": bit, "rep": rep}
         t0 = time.monotonic()
         try:
-            o1, o2, cmp, flips, *_ = flow(a, cmd_dir, tok, system, q0, q1, inject, golden)
-            rec.update(flips=flips, kv=cmp, child_kv_differs=cmp["n_diff"] > 0,
+            o1, o2, cmp, flips, _, _, _, st = flow(a, cmd_dir, tok, system, q0, q1, inject, golden)
+            rec.update(flips=flips, kv=cmp, child_kv_differs=cmp["n_diff"] != 0, when=a.when, stats=st,
                        turn1_changed=o1 != golden["out1"], turn2_changed=o2 != golden["out2"],
                        turn1_first_diff=kv.first_diff(o1, golden["out1"]),
                        turn2_first_diff=kv.first_diff(o2, golden["out2"]))

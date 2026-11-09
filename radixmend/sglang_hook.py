@@ -16,7 +16,9 @@ Commands (field ``op``):
   node, positions ``[pos_lo, pos_hi)``. Fields: ``seed``, ``kinds``, ``bits``,
   ``layers`` (default all), ``flips_per_vector``, ``vectors``.
   ``dry_run: true`` samples and logs the same faults without flipping
-  (golden runs go through the identical code path).
+  (golden runs go through the identical code path). With ``after_tokens``
+  the command waits until a running request has produced that many output
+  tokens (flip after the prefix hit was checked: RQ1-6 TOCTOU condition).
 * ``revert``     undo every flip made since the last revert.
 * ``inject_index`` flip one bit in an index tensor (RQ1-5). Field ``target``:
   ``node_value`` (int64 slot list of the largest first-level node, positions
@@ -84,6 +86,14 @@ def _op_tree_info(sched, cmd):
 
 
 def _op_inject_kv(sched, cmd):
+    at = None
+    if cmd.get("after_tokens"):
+        # deferred (RQ1-6 TOCTOU): wait until a running request is decoding
+        batch = sched.running_batch
+        outs = [len(r.output_ids) for r in (batch.reqs if batch is not None else [])]
+        if not any(o >= int(cmd["after_tokens"]) for o in outs):
+            return None
+        at = max(outs)
     nodes = _first_level(sched)
     if not nodes:
         raise RuntimeError("radix tree is empty: send the warm-up request first")
@@ -114,7 +124,7 @@ def _op_inject_kv(sched, cmd):
         recs = [asdict(r) for r in records]
     for r in recs:
         r["position"] = pos_of.get(r["fault"]["slot"])
-    return {"node_tokens": len(slots_all), "range": [lo, hi], "flips": recs}
+    return {"node_tokens": len(slots_all), "range": [lo, hi], "flips": recs, "at_output_tokens": at}
 
 
 def _op_revert(sched, cmd):
@@ -267,10 +277,16 @@ def _op_secded_stats(sched, cmd):
     return out
 
 
+def _op_hash_stats(sched, cmd):
+    from radixmend import sglang_hash as sh
+
+    return {"enabled": bool(sh._state["pools"]), **sh.stats(reset=bool(cmd.get("reset")))}
+
+
 _OPS = {"tree_info": _op_tree_info, "inject_kv": _op_inject_kv, "revert": _op_revert,
         "inject_index": _op_inject_index, "cancel": _op_cancel,
         "snapshot_kv": _op_snapshot_kv, "compare_kv": _op_compare_kv,
-        "secded_stats": _op_secded_stats}
+        "secded_stats": _op_secded_stats, "hash_stats": _op_hash_stats}
 
 
 def poll(sched, cmd_dir: Path) -> None:

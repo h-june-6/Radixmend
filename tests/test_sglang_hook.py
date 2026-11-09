@@ -137,3 +137,27 @@ def test_snapshot_and_compare_follow_tree_path(tmp_path, monkeypatch):
     assert res["n_diff"] == 1 and res["tokens_differing"] == 1 and res["max_abs_per_layer"][2] > 0
     res = send(tmp_path, sched, {"op": "compare_kv", **{**cmd, "pos_hi": 9}, "name": "g"})
     assert not res["ok"] and "cached" in res["error"]
+
+
+def test_inject_kv_deferred_until_decoding(tmp_path):
+    sched, pool = fake_sched()
+    sched.running_batch = SimpleNamespace(reqs=[SimpleNamespace(output_ids=[1])])
+    before = [t.clone() for t in pool.v_buffer]
+    op = {"op": "inject_kv", "seed": 1, "kinds": ["v"], "bits": [14], "after_tokens": 3}
+    (tmp_path / "d.cmd.json").write_text(json.dumps(op))
+    hk._state["last_poll"] = 0.0
+    hk.poll(sched, tmp_path)
+    assert (tmp_path / "d.cmd.json").exists() and all(torch.equal(a, b) for a, b in zip(before, pool.v_buffer))
+    sched.running_batch.reqs[0].output_ids = [1, 2, 3, 4]
+    hk._state["last_poll"] = 0.0
+    hk.poll(sched, tmp_path)
+    res = json.loads((tmp_path / "d.done.json").read_text())
+    assert res["ok"] and res["at_output_tokens"] == 4 and len(res["flips"]) == 1
+    send(tmp_path, sched, {"op": "revert"})
+    assert all(torch.equal(a, b) for a, b in zip(before, pool.v_buffer))
+
+
+def test_stats_ops_without_modules(tmp_path):
+    sched, _ = fake_sched()
+    assert send(tmp_path, sched, {"op": "secded_stats"})["ok"]
+    assert send(tmp_path, sched, {"op": "hash_stats", "reset": True})["ok"]
