@@ -93,8 +93,16 @@ def flow(a, cmd_dir, tok, system, q0, q1, inject, golden=None):
         else:  # turn 1 tokens diverged: the child is a different sequence
             cmp = {"diverged": True, "n_diff": -1, "max_abs": float("nan")}
         answer = golden["answer"]
-    p2 = chat_ids(tok, sys_msgs + [{"role": "user", "content": q1}, {"role": "assistant", "content": answer},
-                                   {"role": "user", "content": FOLLOW_UP}])
+    if a.turn2 == "own":
+        # p1 + turn 1 tokens + the template tail for the next user turn: same tokens as the
+        # cached child, so turn 2 reuses the child's output KV (derived from the flipped parent)
+        tail = tok.encode("<|im_end|>\n<|im_start|>user\n" + FOLLOW_UP + "<|im_end|>\n<|im_start|>assistant\n"
+                          "<think>\n\n</think>\n\n", add_special_tokens=False)
+        body = out1[:-1] if out1 and out1[-1] == tok.convert_tokens_to_ids("<|im_end|>") else out1
+        p2 = p1 + body + tail
+    else:
+        p2 = chat_ids(tok, sys_msgs + [{"role": "user", "content": q1}, {"role": "assistant", "content": answer},
+                                       {"role": "user", "content": FOLLOW_UP}])
     out2 = kv.generate(a.url, p2, a.max_new)
     stats2 = {op: kv.hook(cmd_dir, {"op": op}) for op in ("hash_stats", "secded_stats")}
     return out1, out2, cmp, inj.get("flips", []), shared, len(p1), answer, {"turn1": stats, "after_turn2": stats2}
@@ -134,6 +142,9 @@ def main() -> None:
     ap.add_argument("--when", choices=["hit", "decode"], default="hit",
                     help="flip before turn 1 (hit) or while turn 1 decodes, after the hit check (decode)")
     ap.add_argument("--after-tokens", type=int, default=4)
+    ap.add_argument("--turn2", choices=["golden", "own"], default="golden",
+                    help="turn 2 repeats turn 1 as the golden answer text (golden) or reuses turn 1's own "
+                         "generated tokens, so it hits the child's cached output KV (own)")
     ap.add_argument("--summarize", action="store_true")
     a = ap.parse_args()
     out = Path(a.out)
@@ -141,13 +152,17 @@ def main() -> None:
     if a.summarize:
         rows = [json.loads(l) for l in tpath.read_text().splitlines() if l.strip()]
         keys = sorted({(r["kind"], r["bit"]) for r in rows})
-        print("kind,bit,n,child_kv_differs,turn1_changed,turn2_changed,turn2_changed_given_kv_differs,median_max_abs")
+        print("kind,bit,n,child_kv_differs(compared),turn1_diverged(no_compare),turn1_changed,turn2_changed,"
+              "turn2_changed_given_kv_differs,turn2_changed_given_turn1_same,median_max_abs")
         for k, b in keys:
             rs = [r for r in rows if r["kind"] == k and r["bit"] == b and not r.get("error")]
-            kvd = [r for r in rs if r["child_kv_differs"]]
+            div = [r for r in rs if r["kv"].get("diverged")]
+            kvd = [r for r in rs if r["child_kv_differs"] and not r["kv"].get("diverged")]
+            same1 = [r for r in rs if not r["turn1_changed"]]
             mx = sorted(r["kv"]["max_abs"] for r in rs if r["kv"]["max_abs"] == r["kv"]["max_abs"])
-            print(f"{k},{b},{len(rs)},{len(kvd)},{sum(r['turn1_changed'] for r in rs)},"
+            print(f"{k},{b},{len(rs)},{len(kvd)},{len(div)},{sum(r['turn1_changed'] for r in rs)},"
                   f"{sum(r['turn2_changed'] for r in rs)},{sum(r['turn2_changed'] for r in kvd)},"
+                  f"{sum(r['turn2_changed'] for r in same1)}/{len(same1)},"
                   f"{mx[len(mx)//2] if mx else 0:.3g}")
         return
     out.mkdir(parents=True, exist_ok=True)

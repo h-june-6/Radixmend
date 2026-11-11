@@ -126,17 +126,50 @@ def positions(spec: str, shared: int) -> tuple[int, int]:
     return int(a), int(b)
 
 
-def run_flow(base, cmd_dir, prompts, inject: dict, warm_new: int, max_new: int):
+def run_flow(base, cmd_dir, prompts, inject: dict, warm_new: int, max_new: int, after_tokens: int = 0):
+    """after_tokens > 0: flip while the first follow-up is decoding (its prefill and
+    the extend-path check have already read the prefix), instead of before it."""
     t0 = time.monotonic()
     flush(base)
     generate(base, prompts[0], warm_new)
     info = hook(cmd_dir, {"op": "tree_info"})
-    inj = hook(cmd_dir, {"op": "inject_kv", **inject})
     try:
-        outs = [generate(base, p, max_new) for p in prompts[1:]]
+        if after_tokens:
+            cid = _send(cmd_dir, {"op": "inject_kv", **inject, "after_tokens": after_tokens})
+            outs = [generate(base, prompts[1], max_new)]
+            inj = _wait(cmd_dir, cid, 5.0)
+            if inj is None:
+                hook(cmd_dir, {"op": "cancel", "target_id": cid})
+                inj = {"flips": [], "not_triggered": True}
+            elif not inj.get("ok", True):
+                raise RuntimeError(inj.get("error"))
+            outs += [generate(base, p, max_new) for p in prompts[2:]]
+        else:
+            inj = hook(cmd_dir, {"op": "inject_kv", **inject})
+            outs = [generate(base, p, max_new) for p in prompts[1:]]
     finally:
         hook(cmd_dir, {"op": "revert"})
     return outs, inj, info, time.monotonic() - t0
+
+
+def _send(cmd_dir: Path, op: dict) -> str:
+    cid = f"{time.time_ns()}"
+    tmp = cmd_dir / f"{cid}.tmp"
+    tmp.write_text(json.dumps(op))
+    os.replace(tmp, cmd_dir / f"{cid}.cmd.json")
+    return cid
+
+
+def _wait(cmd_dir: Path, cid: str, timeout: float):
+    done = cmd_dir / f"{cid}.done.json"
+    t0 = time.monotonic()
+    while not done.exists():
+        if time.monotonic() - t0 > timeout:
+            return None
+        time.sleep(0.005)
+    res = json.loads(done.read_text())
+    done.unlink()
+    return res
 
 
 def first_diff(a: list[int], b: list[int]) -> int | None:
@@ -204,6 +237,9 @@ def main() -> None:
     ap.add_argument("--warm-new", type=int, default=16)
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--flips-per-vector", type=int, default=1)
+    ap.add_argument("--when", choices=["before", "decode"], default="before",
+                    help="flip before the follow-ups, or while the first follow-up decodes")
+    ap.add_argument("--after-tokens", type=int, default=4)
     ap.add_argument("--max-hours", type=float, default=0, help="stop starting new trials after this long")
     ap.add_argument("--summarize", action="store_true")
     a = ap.parse_args()
@@ -222,8 +258,9 @@ def main() -> None:
 
     # Golden twice through the same code path; abort if the server is not reproducible.
     dry = {"seed": 0, "kinds": a.kinds.split(","), "bits": [0], "pos_lo": lo, "pos_hi": hi, "dry_run": True}
-    g1, *_ = run_flow(a.url, cmd_dir, prompts, dry, a.warm_new, a.max_new)
-    g2, _, info, secs = run_flow(a.url, cmd_dir, prompts, dry, a.warm_new, a.max_new)
+    at = a.after_tokens if a.when == "decode" else 0
+    g1, *_ = run_flow(a.url, cmd_dir, prompts, dry, a.warm_new, a.max_new, at)
+    g2, _, info, secs = run_flow(a.url, cmd_dir, prompts, dry, a.warm_new, a.max_new, at)
     if g1 != g2:
         print("golden runs differ; fix determinism before sweeping", [first_diff(x, y) for x, y in zip(g1, g2)])
         sys.exit(2)
@@ -249,6 +286,8 @@ def main() -> None:
     n_new = 0
     for kind, bit, rep in todo:
         tid = f"{kind}-{a.pos}-f{a.flips_per_vector}-b{bit:02d}-r{rep:03d}"
+        if a.when == "decode":
+            tid = "dec-" + tid
         if tid in done:
             continue
         if a.max_hours and time.monotonic() - t_start > a.max_hours * 3600:
@@ -258,9 +297,11 @@ def main() -> None:
         # kind "none" is a control trial: same flow, faults sampled but not flipped
         inject = {"seed": seed, "kinds": ["v" if kind == "none" else kind], "bits": [bit], "pos_lo": lo,
                   "pos_hi": hi, "flips_per_vector": a.flips_per_vector, "dry_run": kind == "none"}
-        rec = {"trial": tid, "kind": kind, "bit": bit, "rep": rep, "pos": a.pos, "golden_id": gid}
+        rec = {"trial": tid, "kind": kind, "bit": bit, "rep": rep, "pos": a.pos, "golden_id": gid, "when": a.when}
         try:
-            outs, inj, _, secs = run_flow(a.url, cmd_dir, prompts, inject, a.warm_new, a.max_new)
+            st0 = hook(cmd_dir, {"op": "secded_stats", "reset": True})
+            outs, inj, _, secs = run_flow(a.url, cmd_dir, prompts, inject, a.warm_new, a.max_new, at)
+            rec["secded"] = hook(cmd_dir, {"op": "secded_stats"}) if st0.get("enabled") else None
             diffs = [first_diff(o, g) for o, g in zip(outs, g1)]
             rec.update(flips=inj["flips"], first_diff=diffs, n_changed=sum(d is not None for d in diffs),
                        any_changed=any(d is not None for d in diffs), seconds=round(secs, 2), outputs=outs)

@@ -11,9 +11,13 @@ How it maps onto SGLang:
   and compares. On any mismatch the match is turned into a full miss, so the
   request recomputes its whole prompt (and its new child KV is built from clean
   values).
-* The corrupted node itself stays in the tree (SGLang keeps the old slots when
-  the recomputed prefix is inserted again), so every later hit on it detects
-  and recomputes again. That is the baseline's cost, not a repair.
+* Write-back: SGLang's insert keeps the tree's existing slots for a key it
+  already has, frees the request's fresh duplicates and rebinds the request
+  to the old (corrupted) slots, so decode would read them again. The insert
+  wrapper therefore copies the recomputed K/V (all layers) and digests from
+  the fresh slots into the old ones first. This matches "discard the block
+  and recompute": the cached block is clean afterwards. (Found on the server
+  2026-11-10: without it bit-14 trials still changed at output position ~2.)
 
 Digest: sum over (layer, K/V, head, element) of raw16(x) * w with fixed random
 odd 64-bit weights, wrapping mod 2^64. Any single flipped bit changes it (w is
@@ -29,8 +33,9 @@ import os
 
 import torch
 
-_state = {"weights": None, "pools": [], "stats": {"hits_checked": 0, "tokens_checked": 0,
-                                                    "mismatches": 0, "tokens_recomputed": 0}}
+_state = {"weights": None, "pools": [], "pending": [],
+          "stats": {"hits_checked": 0, "tokens_checked": 0, "mismatches": 0, "tokens_recomputed": 0,
+                    "tokens_written_back": 0}}
 
 
 def _weights(n_layers: int, heads: int, dim: int, device) -> torch.Tensor:
@@ -91,6 +96,38 @@ def verify(pool, slots: torch.Tensor) -> int:
     return int((digest_now(pool, slots) != pool.rm_digest[slots.to(torch.int64)]).sum().item())
 
 
+def write_back(pool, old: torch.Tensor, new: torch.Tensor) -> int:
+    """Copy K/V of every layer (and digests, and SECDED checkwords if present) new -> old."""
+    old = old.to(torch.int64)
+    new = new.to(torch.int64)
+    keep = old != new
+    old, new = old[keep], new[keep]
+    if old.numel() == 0:
+        return 0
+    for lid in range(len(pool.k_buffer)):
+        pool.k_buffer[lid][old] = pool.k_buffer[lid][new]
+        pool.v_buffer[lid][old] = pool.v_buffer[lid][new]
+        for name in ("rm_k_cw", "rm_v_cw"):
+            cws = getattr(pool, name, None)
+            if cws is not None:
+                cws[lid][old] = cws[lid][new]
+    pool.rm_digest[old] = pool.rm_digest[new]
+    return int(old.numel())
+
+
+def repair_on_insert(pool, token_ids, value) -> int:
+    """If this insert re-adds a prefix that failed verification, write the fresh KV back."""
+    done = 0
+    for i, (key, old) in enumerate(list(_state["pending"])):
+        n = len(key)
+        if value is None or len(value) < n or len(token_ids) < n or tuple(token_ids[:n]) != key:
+            continue
+        done += write_back(pool, old, value[:n].to(old.device))
+        _state["pending"].remove((key, old))
+    _state["stats"]["tokens_written_back"] += done
+    return done
+
+
 def stats(reset: bool = False) -> dict:
     out = dict(_state["stats"])
     if reset:
@@ -140,10 +177,21 @@ def install() -> None:
         if verify(pool, slots):
             st["mismatches"] += 1
             st["tokens_recomputed"] += n
+            key = tuple(int(t) for t in list(params.key.token_ids)[:n])
+            if all(k != key for k, _ in _state["pending"]):
+                _state["pending"].append((key, slots.clone()))
             return zero_match_result(self, res, extra_key=extra_key)
         return res
+
+    orig_insert = urc.UnifiedRadixCache.insert
+
+    def insert(self, params):
+        if _state["pending"] and params.key is not None and params.value is not None:
+            repair_on_insert(_state["pools"][-1], list(params.key.token_ids), params.value)
+        return orig_insert(self, params)
 
     mp.MHATokenToKVPool.__init__ = __init__
     mp.MHATokenToKVPool.set_kv_buffer = set_kv_buffer
     urc.UnifiedRadixCache.match_prefix = match_prefix
+    urc.UnifiedRadixCache.insert = insert
     mp.MHATokenToKVPool._rm_hash = True
