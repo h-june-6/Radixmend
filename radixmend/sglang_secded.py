@@ -191,8 +191,8 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
            inv_b_ptr, phase_ptr, BLOCK_N: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
            BLOCK_DV: tl.constexpr,
            logit_cap: tl.constexpr, E: tl.constexpr, B: tl.constexpr, TM: tl.constexpr,
-           POPC: tl.constexpr, SAMPLE: tl.constexpr):
-    """Attention over one KV split. TM: 0 no check, 1 full, 2 gate, 3 signature (no correction).
+           POPC: tl.constexpr, SAMPLE: tl.constexpr, WB: tl.constexpr = False):
+    """Attention over one KV split. WB: write corrected words back to the KV buffer. TM: 0 no check, 1 full, 2 gate, 3 signature (no correction).
 
     TM 3 only accumulates, element-wise, the XOR of every K and V word and of the
     stored checkwords; one reduction at the end compares the parity / bit
@@ -241,6 +241,9 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
                 if a + b_ > 0:
                     k = (k.to(tl.int16, bitcast=True).to(tl.int32) ^ fk).to(tl.int16).to(
                         K_Buffer.dtype.element_ty, bitcast=True)
+                    if WB:
+                        # only the corrected words; racing programs write the same value
+                        tl.store(K_Buffer + offs_buf_k, k, mask=mask_n[None, :] & mask_d[:, None] & (fk != 0))
                     nk_fix += a
                     nk_bad += b_
         qk = tl.dot(q_k, k)
@@ -261,6 +264,8 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
                 if a + b_ > 0:
                     v = (v.to(tl.int16, bitcast=True).to(tl.int32) ^ fv).to(tl.int16).to(
                         V_Buffer.dtype.element_ty, bitcast=True)
+                    if WB:
+                        tl.store(V_Buffer + offs_buf_v, v, mask=mask_n[:, None] & mask_dv[None, :] & (fv != 0))
                     nv_fix += a
                     nv_bad += b_
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
@@ -297,7 +302,7 @@ def _fwd_grouped_kernel_stage1_secded(
     BLOCK_DV: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_H: tl.constexpr, MIN_BLOCK_KV: tl.constexpr,
     logit_cap: tl.constexpr, Lk: tl.constexpr, Lv: tl.constexpr, E: tl.constexpr, B: tl.constexpr,
     CHECK: tl.constexpr, GATE: tl.constexpr = False, POPC: tl.constexpr = False,
-    SAMPLE: tl.constexpr = 1, phase_ptr=None, SIG: tl.constexpr = False,
+    SAMPLE: tl.constexpr = 1, phase_ptr=None, SIG: tl.constexpr = False, WB: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0).to(tl.int64)
     cur_head_id = tl.program_id(1)
@@ -336,7 +341,7 @@ def _fwd_grouped_kernel_stage1_secded(
             q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, cur_batch_kv_start_idx, split_kv_start,
             split_kv_end, cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d, mask_dv,
             stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr, bmask_ptr, inv_e_ptr,
-            inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B, TM, POPC, SAMPLE)
+            inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B, TM, POPC, SAMPLE, WB)
         if SIG:
             if bad > 0:
                 # optimistic pass saw a signature mismatch somewhere in this split: redo it
@@ -346,7 +351,7 @@ def _fwd_grouped_kernel_stage1_secded(
                     split_kv_end, cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d,
                     mask_dv, stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr,
                     bmask_ptr, inv_e_ptr, inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B,
-                    1, POPC, 1)
+                    1, POPC, 1, WB)
                 tl.atomic_add(err_ptr + 8, 1)
 
         offs_mid_o = (cur_batch * stride_mid_ob + cur_head[:, None] * stride_mid_oh
@@ -417,7 +422,7 @@ def encode_rows(buf, cw, loc) -> None:
 
 def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                   num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap=0.0, check=True,
-                  block_h=16, min_block_kv=32, mode="full", popc=None, sample=1):
+                  block_h=16, min_block_kv=32, mode="full", popc=None, sample=1, wb=False):
     """Grouped decode stage 1 with check-on-load; same outputs as SGLang's stage 1."""
     t = _tables(k_buffer.device)
     code = _state["code"]
@@ -436,7 +441,7 @@ def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr
         BLOCK_DV=triton.next_power_of_2(Lv), BLOCK_N=32, BLOCK_H=block_h,
         MIN_BLOCK_KV=min_block_kv, logit_cap=logit_cap, Lk=Lk, Lv=Lv,
         E=code.e_bits, B=code.b_bits, CHECK=check, GATE=(mode == "gate"), SIG=(mode == "sig"),
-        POPC=(k_buffer.is_cuda if popc is None else popc), SAMPLE=sample,
+        POPC=(k_buffer.is_cuda if popc is None else popc), SAMPLE=sample, WB=wb,
         phase_ptr=_state["phase"], num_warps=4, num_stages=2,
     )
 
@@ -486,6 +491,9 @@ def install() -> None:
     assert mode in ("full", "gate", "sig"), mode
     sample = int(os.environ.get("RADIXMEND_SECDED_SAMPLE", "1"))
     popc = {"1": True, "0": False}.get(os.environ.get("RADIXMEND_SECDED_POPC", ""), None)
+    # RADIXMEND_SECDED_WB=1: decode writes corrected words back to the KV buffer, so a
+    # fault is fixed once instead of on every step (and cannot pair up with a later flip)
+    wb = os.environ.get("RADIXMEND_SECDED_WB") == "1"
 
     orig_init = mp.MHATokenToKVPool.__init__
 
@@ -522,7 +530,7 @@ def install() -> None:
         launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                       num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap, check,
                       block_h=da._GROUPED_BLOCK_H, min_block_kv=da._MIN_BLOCK_KV,
-                      mode=mode, popc=popc, sample=sample)
+                      mode=mode, popc=popc, sample=sample, wb=wb)
 
     from sglang.kernels.ops.attention import extend_attention as ea
 

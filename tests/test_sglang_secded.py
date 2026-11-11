@@ -179,3 +179,31 @@ def test_sig_redoes_only_bad_splits():
     run(q, k, v2, kcw, vcw, indptr, idx, 3, mode="sig")
     e = ss.errors()
     assert e[8] == 1 and e[2] == 1
+
+
+@pytest.mark.parametrize("mode", ["full", "gate", "sig"])
+def test_write_back_fixes_buffer_once(mode):
+    q, k, v, indptr, idx, _ = setup()
+    kcw, vcw = encode(k), encode(v)
+    clean = run(q, k, v, kcw, vcw, indptr, idx, 2, check=False)
+    k2, v2 = k.clone(), v.clone()
+    k2.view(torch.int16)[int(idx[5]), 1, 77] ^= 1 << 14
+    v2.view(torch.int16)[int(idx[50]), 0, 3] ^= 1 << 7
+    ss._state["err"].zero_()
+    out = run(q, k2, v2, kcw, vcw, indptr, idx, 2, mode=mode, wb=True)
+    assert torch.equal(clean[0], out[0])
+    assert ss.errors()[:4] == [1, 0, 1, 0]
+    assert torch.equal(k2.view(torch.int16), k.view(torch.int16))
+    assert torch.equal(v2.view(torch.int16), v.view(torch.int16))
+    ss._state["err"].zero_()
+    run(q, k2, v2, kcw, vcw, indptr, idx, 2, mode=mode, wb=True)
+    assert ss.errors()[:4] == [0, 0, 0, 0]
+
+
+def test_no_write_back_leaves_buffer():
+    q, k, v, indptr, idx, _ = setup()
+    kcw, vcw = encode(k), encode(v)
+    k2 = k.clone()
+    k2.view(torch.int16)[int(idx[5]), 1, 77] ^= 1 << 14
+    run(q, k2, v, kcw, vcw, indptr, idx, mode="gate")
+    assert not torch.equal(k2.view(torch.int16), k.view(torch.int16))
