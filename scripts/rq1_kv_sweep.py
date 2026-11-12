@@ -126,12 +126,17 @@ def positions(spec: str, shared: int) -> tuple[int, int]:
     return int(a), int(b)
 
 
-def run_flow(base, cmd_dir, prompts, inject: dict, warm_new: int, max_new: int, after_tokens: int = 0):
+def run_flow(base, cmd_dir, prompts, inject: dict, warm_new: int, max_new: int, after_tokens: int = 0,
+             warm_child: bool = False):
     """after_tokens > 0: flip while the first follow-up is decoding (its prefill and
-    the extend-path check have already read the prefix), instead of before it."""
+    the extend-path check have already read the prefix), instead of before it.
+    warm_child: also warm up with the first follow-up, which splits the shared prompt
+    off into a parent node and leaves the follow-up's question as a child node."""
     t0 = time.monotonic()
     flush(base)
     generate(base, prompts[0], warm_new)
+    if warm_child:
+        generate(base, prompts[1], warm_new)
     info = hook(cmd_dir, {"op": "tree_info"})
     try:
         if after_tokens:
@@ -240,6 +245,16 @@ def main() -> None:
     ap.add_argument("--when", choices=["before", "decode"], default="before",
                     help="flip before the follow-ups, or while the first follow-up decodes")
     ap.add_argument("--after-tokens", type=int, default=4)
+    ap.add_argument("--target", choices=["data", "cw"], default="data",
+                    help="cw: flip module A checkword bits (--bits 0-15) instead of the K/V data")
+    ap.add_argument("--bits-each", default="",
+                    help="2-bit faults at two given positions in two elements of one vector, e.g. "
+                         "'14:7,14:0,7:0' (one pair per trial group; replaces --bits)")
+    ap.add_argument("--node", choices=["first", "deepest"], default="first",
+                    help="inject into the largest first-level node or the deepest node")
+    ap.add_argument("--warm-child", action="store_true",
+                    help="also run the first follow-up during warm-up, so the tree has a child node "
+                         "below the shared prompt (needed for --node deepest with --when before)")
     ap.add_argument("--max-hours", type=float, default=0, help="stop starting new trials after this long")
     ap.add_argument("--summarize", action="store_true")
     a = ap.parse_args()
@@ -259,8 +274,12 @@ def main() -> None:
     # Golden twice through the same code path; abort if the server is not reproducible.
     dry = {"seed": 0, "kinds": a.kinds.split(","), "bits": [0], "pos_lo": lo, "pos_hi": hi, "dry_run": True}
     at = a.after_tokens if a.when == "decode" else 0
-    g1, *_ = run_flow(a.url, cmd_dir, prompts, dry, a.warm_new, a.max_new, at)
-    g2, _, info, secs = run_flow(a.url, cmd_dir, prompts, dry, a.warm_new, a.max_new, at)
+    extra = {"node": a.node} if a.node != "first" else {}
+    if a.target != "data":
+        extra["target"] = a.target
+    dry.update(extra)
+    g1, *_ = run_flow(a.url, cmd_dir, prompts, dry, a.warm_new, a.max_new, at, a.warm_child)
+    g2, _, info, secs = run_flow(a.url, cmd_dir, prompts, dry, a.warm_new, a.max_new, at, a.warm_child)
     if g1 != g2:
         print("golden runs differ; fix determinism before sweeping", [first_diff(x, y) for x, y in zip(g1, g2)])
         sys.exit(2)
@@ -279,13 +298,22 @@ def main() -> None:
     done = set()
     if tpath.exists():
         done = {json.loads(l)["trial"] for l in tpath.read_text().splitlines() if l.strip()}
-    todo = [(k, b, r) for k in a.kinds.split(",") for b in parse_bits(a.bits) for r in range(a.reps)]
+    groups = [p.strip() for p in a.bits_each.split(",") if p.strip()] if a.bits_each else parse_bits(a.bits)
+    todo = [(k, b, r) for k in a.kinds.split(",") for b in groups for r in range(a.reps)]
     # interleave bits so a partial sweep still covers every bit evenly
     todo.sort(key=lambda t: (t[2], t[0], t[1]))
     t_start = time.monotonic()
     n_new = 0
     for kind, bit, rep in todo:
-        tid = f"{kind}-{a.pos}-f{a.flips_per_vector}-b{bit:02d}-r{rep:03d}"
+        if isinstance(bit, str):  # --bits-each pair "a:b"
+            pa, pb = (int(x) for x in bit.split(":"))
+            tid = f"{kind}-{a.pos}-each{pa:02d}x{pb:02d}-r{rep:03d}"
+        else:
+            tid = f"{kind}-{a.pos}-f{a.flips_per_vector}-b{bit:02d}-r{rep:03d}"
+        if a.target != "data":
+            tid = f"{a.target}-" + tid
+        if a.node != "first":
+            tid = f"{a.node}-" + tid
         if a.when == "decode":
             tid = "dec-" + tid
         if tid in done:
@@ -295,13 +323,20 @@ def main() -> None:
             break
         seed = int(hashlib.sha256(tid.encode()).hexdigest()[:8], 16)
         # kind "none" is a control trial: same flow, faults sampled but not flipped
-        inject = {"seed": seed, "kinds": ["v" if kind == "none" else kind], "bits": [bit], "pos_lo": lo,
-                  "pos_hi": hi, "flips_per_vector": a.flips_per_vector, "dry_run": kind == "none"}
-        rec = {"trial": tid, "kind": kind, "bit": bit, "rep": rep, "pos": a.pos, "golden_id": gid, "when": a.when}
+        inject = {"seed": seed, "kinds": ["v" if kind == "none" else kind], "pos_lo": lo,
+                  "pos_hi": hi, "flips_per_vector": a.flips_per_vector, "dry_run": kind == "none", **extra}
+        if isinstance(bit, str):
+            inject["bits_each"] = [pa, pb]
+        else:
+            inject["bits"] = [bit]
+        rec = {"trial": tid, "kind": kind, "bit": bit, "rep": rep, "pos": a.pos, "golden_id": gid, "when": a.when,
+               "target": a.target, "node": a.node}
         try:
             st0 = hook(cmd_dir, {"op": "secded_stats", "reset": True})
-            outs, inj, _, secs = run_flow(a.url, cmd_dir, prompts, inject, a.warm_new, a.max_new, at)
+            outs, inj, _, secs = run_flow(a.url, cmd_dir, prompts, inject, a.warm_new, a.max_new, at, a.warm_child)
             rec["secded"] = hook(cmd_dir, {"op": "secded_stats"}) if st0.get("enabled") else None
+            rec["node_depth"] = inj.get("node_depth")
+            rec["node_tokens"] = inj.get("node_tokens")
             diffs = [first_diff(o, g) for o, g in zip(outs, g1)]
             rec.update(flips=inj["flips"], first_diff=diffs, n_changed=sum(d is not None for d in diffs),
                        any_changed=any(d is not None for d in diffs), seconds=round(secs, 2), outputs=outs)
