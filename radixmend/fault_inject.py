@@ -114,13 +114,18 @@ def sample_kv_faults(
     elem_bits: int = 16,
     flips_per_vector: int = 1,
     vectors: int = 1,
+    bits_each: Sequence[int] | None = None,
 ) -> list[KVFault]:
     """Pick ``vectors`` random (layer, kind, slot, head) vectors and flip
     ``flips_per_vector`` distinct bits inside each one.
 
     With ``bits`` given, every flip uses a bit position from that list (e.g. a
-    single position for a per-bit-position sweep).
+    single position for a per-bit-position sweep). With ``bits_each`` given,
+    flip i of each vector uses bit ``bits_each[i]`` on a distinct element
+    (e.g. ``[14, 7]`` for a 2-bit error at different bit positions).
     """
+    if bits_each is not None:
+        flips_per_vector = len(bits_each)
 
     def pick(seq):
         return seq[int(torch.randint(len(seq), (1,), generator=gen))]
@@ -130,6 +135,9 @@ def sample_kv_faults(
         layer, kind, slot = pick(list(layers)), pick(list(kinds)), pick(list(slots))
         head = int(torch.randint(head_num, (1,), generator=gen))
         chosen: set[tuple[int, int]] = set()
+        if bits_each is not None:
+            elems = torch.randperm(head_dim, generator=gen)[: len(bits_each)].tolist()
+            chosen = {(int(e), int(b)) for e, b in zip(elems, bits_each)}
         while len(chosen) < flips_per_vector:
             elem = int(torch.randint(head_dim, (1,), generator=gen))
             bit = pick(list(bits)) if bits is not None else int(torch.randint(elem_bits, (1,), generator=gen))

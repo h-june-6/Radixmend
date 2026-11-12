@@ -161,3 +161,31 @@ def test_stats_ops_without_modules(tmp_path):
     sched, _ = fake_sched()
     assert send(tmp_path, sched, {"op": "secded_stats"})["ok"]
     assert send(tmp_path, sched, {"op": "hash_stats", "reset": True})["ok"]
+
+
+def test_bits_each_flips_distinct_elements_at_given_bits(tmp_path):
+    sched, pool = fake_sched()
+    res = send(tmp_path, sched, {"op": "inject_kv", "seed": 3, "kinds": ["k"], "bits_each": [14, 7]})
+    fs = [r["fault"] for r in res["flips"]]
+    assert sorted(f["bit"] for f in fs) == [7, 14]
+    assert len({f["elem"] for f in fs}) == 2
+    assert len({(f["layer"], f["slot"], f["head"]) for f in fs}) == 1
+    send(tmp_path, sched, {"op": "revert"})
+
+
+def test_deepest_node_and_checkword_target(tmp_path):
+    sched, pool = fake_sched()
+    a = sched.tree_cache.tree_core.root_node.children["a"]
+    a.children = {"c": Node(torch.arange(50, 53))}
+    pool.rm_k_cw = [torch.zeros(64, 2, dtype=torch.int16) for _ in range(3)]
+    pool.rm_v_cw = [torch.zeros(64, 2, dtype=torch.int16) for _ in range(3)]
+    data_before = [t.clone() for t in pool.v_buffer]
+    res = send(tmp_path, sched, {"op": "inject_kv", "seed": 1, "kinds": ["v"], "bits": [15],
+                                 "node": "deepest", "target": "cw"})
+    assert res["node_depth"] == 2 and res["node_tokens"] == 3
+    f = res["flips"][0]
+    assert 50 <= f["fault"]["slot"] < 53 and f["new"] == 0x8000
+    assert int(pool.rm_v_cw[f["fault"]["layer"]][f["fault"]["slot"], f["fault"]["head"]]) == -0x8000
+    assert all(torch.equal(x, y) for x, y in zip(data_before, pool.v_buffer))
+    assert send(tmp_path, sched, {"op": "revert"})["reverted"] == 1
+    assert all(int(t.abs().sum()) == 0 for t in pool.rm_v_cw)

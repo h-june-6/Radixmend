@@ -53,7 +53,7 @@ import torch
 
 from radixmend import fault_inject as fi
 
-_state = {"records": [], "last_poll": 0.0}
+_state = {"records": [], "cw_records": [], "last_poll": 0.0}
 
 
 def _sync() -> None:
@@ -94,10 +94,17 @@ def _op_inject_kv(sched, cmd):
         if not any(o >= int(cmd["after_tokens"]) for o in outs):
             return None
         at = max(outs)
-    nodes = _first_level(sched)
-    if not nodes:
-        raise RuntimeError("radix tree is empty: send the warm-up request first")
-    node = max(nodes, key=lambda n: len(fi.node_value(n)))
+    if cmd.get("node", "first") == "deepest":
+        # deepest node with KV (ties: the longest), e.g. a child below the shared prompt
+        cands = list(fi.iter_nodes(sched.tree_cache.tree_core.root_node))
+        if not cands:
+            raise RuntimeError("radix tree is empty: send the warm-up request first")
+        node, depth = max(cands, key=lambda nd: (nd[1], len(fi.node_value(nd[0]))))
+    else:
+        nodes = _first_level(sched)
+        if not nodes:
+            raise RuntimeError("radix tree is empty: send the warm-up request first")
+        node, depth = max(nodes, key=lambda n: len(fi.node_value(n))), 1
     slots_all = fi.node_slots(node)
     lo, hi = int(cmd.get("pos_lo", 0)), int(cmd.get("pos_hi", len(slots_all)))
     hi = min(hi, len(slots_all))
@@ -113,9 +120,13 @@ def _op_inject_kv(sched, cmd):
         gen, slots, layers, head_num, head_dim,
         kinds=cmd.get("kinds", ["v"]), bits=cmd.get("bits"),
         flips_per_vector=int(cmd.get("flips_per_vector", 1)), vectors=int(cmd.get("vectors", 1)),
+        bits_each=cmd.get("bits_each"),
     )
     pos_of = {s: lo + i for i, s in enumerate(slots)}
-    if cmd.get("dry_run"):
+    if cmd.get("target", "data") == "cw":
+        # flip bits of the module A checkwords instead of the data (data must survive)
+        recs = _flip_checkwords(pool, faults, bool(cmd.get("dry_run")))
+    elif cmd.get("dry_run"):
         recs = [{"target": "kv", "fault": asdict(f), "dry_run": True} for f in faults]
     else:
         records = fi.inject_kv(k, v, faults)
@@ -124,15 +135,46 @@ def _op_inject_kv(sched, cmd):
         recs = [asdict(r) for r in records]
     for r in recs:
         r["position"] = pos_of.get(r["fault"]["slot"])
-    return {"node_tokens": len(slots_all), "range": [lo, hi], "flips": recs, "at_output_tokens": at}
+    return {"node_tokens": len(slots_all), "node_depth": depth, "range": [lo, hi], "flips": recs,
+            "at_output_tokens": at}
+
+
+def _flip_checkwords(pool, faults, dry_run: bool) -> list[dict]:
+    """Flip checkword bit ``f.bit`` of (layer, kind, slot, head); f.elem is ignored."""
+    cws = {"k": getattr(pool, "rm_k_cw", None), "v": getattr(pool, "rm_v_cw", None)}
+    if cws["k"] is None:
+        raise RuntimeError("checkword buffers missing: start the server with RADIXMEND_SECDED=1")
+    recs, seen = [], set()
+    for f in faults:
+        key = (f.layer, f.kind, f.slot, f.head, f.bit)
+        if key in seen:
+            continue
+        seen.add(key)
+        t = cws[f.kind][f.layer]
+        old = int(t[f.slot, f.head].item())
+        new = ((old & 0xFFFF) ^ (1 << f.bit))
+        new = new - 0x10000 if new >= 0x8000 else new
+        if not dry_run:
+            t[f.slot, f.head] = new
+            _state["cw_records"].append((t, f.slot, f.head, old))
+        recs.append({"target": "cw", "fault": {"layer": f.layer, "kind": f.kind, "slot": f.slot,
+                                                "head": f.head, "bit": f.bit},
+                     "old": old & 0xFFFF, "new": new & 0xFFFF, "dry_run": dry_run})
+    if not dry_run:
+        _sync()
+    return recs
 
 
 def _op_revert(sched, cmd):
     pool = _kv_pool(sched)
     n = len(_state["records"])
     fi.revert(_state["records"], k_buffer=pool.k_buffer, v_buffer=pool.v_buffer)
+    for t, slot, head, old in reversed(_state["cw_records"]):
+        t[slot, head] = old
+    n += len(_state["cw_records"])
     _sync()
     _state["records"] = []
+    _state["cw_records"] = []
     return {"reverted": n}
 
 
