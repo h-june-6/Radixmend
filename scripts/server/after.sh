@@ -10,7 +10,9 @@ while [ $# -gt 0 ] && [ "$1" != "--" ]; do waits+=("$1"); shift; done
 [ "${1:-}" = "--" ] && shift
 [ $# -gt 0 ] || { echo "usage: after.sh <session>... -- <command>..."; exit 2; }
 for s in "${waits[@]}"; do
-  while tmux has-session -t "$s" 2>/dev/null; do sleep 20; done
+  # "=name": exact match. Without "=", tmux matches by prefix, so waiting on "rq2"
+  # from inside a session named "rq2b" would wait on itself forever.
+  while tmux has-session -t "=$s" 2>/dev/null; do sleep 20; done
 done
 echo "[$(date -Is)] after.sh: ${waits[*]} finished, running: $*"
 cd "$HOME/radixmend" && exec "$@"
