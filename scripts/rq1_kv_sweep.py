@@ -275,6 +275,10 @@ def main() -> None:
     dry = {"seed": 0, "kinds": a.kinds.split(","), "bits": [0], "pos_lo": lo, "pos_hi": hi, "dry_run": True}
     at = a.after_tokens if a.when == "decode" else 0
     extra = {"node": a.node} if a.node != "first" else {}
+    if a.node == "deepest":
+        # deepest node on the cached path of the next follow-up prompt, so the flipped
+        # KV is one that request actually reuses (not a leaf nobody reads again)
+        extra["tokens"] = prompts[1]
     if a.target != "data":
         extra["target"] = a.target
     dry.update(extra)
