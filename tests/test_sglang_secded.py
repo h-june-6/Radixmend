@@ -207,3 +207,35 @@ def test_no_write_back_leaves_buffer():
     k2.view(torch.int16)[int(idx[5]), 1, 77] ^= 1 << 14
     run(q, k2, v, kcw, vcw, indptr, idx, mode="gate")
     assert not torch.equal(k2.view(torch.int16), k.view(torch.int16))
+
+
+@pytest.mark.parametrize("mode", ["full", "sig"])
+def test_checkword_error_counted_rewritten_data_kept(mode):
+    q, k, v, indptr, idx, _ = setup()
+    kcw, vcw = encode(k), encode(v)
+    clean = run(q, k, v, kcw, vcw, indptr, idx, 2, check=False)
+    good = kcw.clone()
+    s = int(idx[5])
+    kcw[s, 1] = (kcw[s, 1].to(torch.int32) ^ 1).to(torch.int16)  # parity bit of the stored checkword
+    ss._state["err"].zero_()
+    out = run(q, k, v, kcw, vcw, indptr, idx, 2, mode=mode, wb=True)
+    assert torch.equal(clean[0], out[0])
+    e = ss.errors()
+    assert e[:4] == [0, 0, 0, 0] and e[9] == 1
+    assert torch.equal(kcw, good)
+    ss._state["err"].zero_()
+    run(q, k, v, kcw, vcw, indptr, idx, 2, mode=mode, wb=True)
+    assert ss.errors()[9] == 0 and ss.errors()[8] == 0
+
+
+def test_prefix_check_rewrites_bad_checkword():
+    q, k, v, indptr, idx, _ = setup()
+    kcw = encode(k)
+    good = kcw.clone()
+    s = int(idx[3])
+    kcw[s, 0] = (kcw[s, 0].to(torch.int32) ^ (1 << 3)).to(torch.int16)
+    before = k.clone()
+    ss._state["err"].zero_()
+    ss.check_fix_inplace(k, kcw, idx, indptr, 4)
+    assert ss.errors()[4:6] == [0, 0] and ss.errors()[9] == 1
+    assert torch.equal(kcw, good) and torch.equal(k.view(torch.int16), before.view(torch.int16))

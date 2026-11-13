@@ -94,8 +94,16 @@ def _op_inject_kv(sched, cmd):
         if not any(o >= int(cmd["after_tokens"]) for o in outs):
             return None
         at = max(outs)
-    if cmd.get("node", "first") == "deepest":
-        # deepest node with KV (ties: the longest), e.g. a child below the shared prompt
+    if cmd.get("node", "first") == "deepest" and cmd.get("tokens"):
+        # deepest node on the cached path of ``tokens`` (the prompt served next), only
+        # the part of it that prompt reuses, so the flip is actually read
+        path = _path_nodes(sched, [int(t) for t in cmd["tokens"]])
+        if not path:
+            raise RuntimeError("no cached prefix of the given tokens")
+        node, m = path[-1]
+        depth = len(path)
+    elif cmd.get("node", "first") == "deepest":
+        # deepest node with KV (ties: the longest); may be a leaf no later request reads
         cands = list(fi.iter_nodes(sched.tree_cache.tree_core.root_node))
         if not cands:
             raise RuntimeError("radix tree is empty: send the warm-up request first")
@@ -106,6 +114,8 @@ def _op_inject_kv(sched, cmd):
             raise RuntimeError("radix tree is empty: send the warm-up request first")
         node, depth = max(nodes, key=lambda n: len(fi.node_value(n))), 1
     slots_all = fi.node_slots(node)
+    if cmd.get("node", "first") == "deepest" and cmd.get("tokens"):
+        slots_all = slots_all[:m]
     lo, hi = int(cmd.get("pos_lo", 0)), int(cmd.get("pos_hi", len(slots_all)))
     hi = min(hi, len(slots_all))
     if lo >= hi:
@@ -242,10 +252,10 @@ def _op_inject_index(sched, cmd):
     raise ValueError(f"unknown index target {target}")
 
 
-def _path_slots(sched, tokens: list[int]) -> list[int]:
-    """KV slots of the longest cached prefix of ``tokens`` (walks the tree by key)."""
+def _path_nodes(sched, tokens: list[int]) -> list[tuple[object, int]]:
+    """(node, matched tokens) along the longest cached prefix of ``tokens`` (walks the tree by key)."""
     node = sched.tree_cache.tree_core.root_node
-    pos, slots = 0, []
+    pos, path = 0, []
     while pos < len(tokens):
         nxt = None
         for c in node.children.values():
@@ -258,11 +268,19 @@ def _path_slots(sched, tokens: list[int]) -> list[int]:
         m = 0
         while m < len(ckey) and pos + m < len(tokens) and ckey[m] == tokens[pos + m]:
             m += 1
-        slots += fi.node_slots(nxt)[:m]
+        path.append((nxt, m))
         pos += m
         if m < len(ckey):
             break
         node = nxt
+    return path
+
+
+def _path_slots(sched, tokens: list[int]) -> list[int]:
+    """KV slots of the longest cached prefix of ``tokens``."""
+    slots = []
+    for n, m in _path_nodes(sched, tokens):
+        slots += fi.node_slots(n)[:m]
     return slots
 
 
@@ -310,12 +328,13 @@ def _op_secded_stats(sched, cmd):
     errs = ss.errors()
     if cmd.get("reset") and ss._state["err"] is not None:
         ss._state["err"].zero_()
-    errs = (errs or []) + [0] * (9 - len(errs or []))
+    errs = (errs or []) + [0] * (10 - len(errs or []))
     names = ["k_corrected", "k_uncorrectable", "v_corrected", "v_uncorrectable"]
     out = {"enabled": ss._state["err"] is not None}
     out.update({f"decode_{n}": errs[i] for i, n in enumerate(names)})
     out.update({f"extend_{n}": errs[4 + i] for i, n in enumerate(names)})
     out["sig_redo_splits"] = errs[8]
+    out["checkword_errors"] = errs[9]
     return out
 
 

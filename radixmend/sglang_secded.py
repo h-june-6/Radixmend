@@ -77,11 +77,13 @@ def _check_tile(x16, cw, mask_n, eidx, e_lab, bmask_ptr, inv_e_ptr, inv_b_ptr, A
                 E: tl.constexpr, B: tl.constexpr, GATE: tl.constexpr, POPC: tl.constexpr):
     """Check one K or V tile (vectors along AXIS, raw int16 bits).
 
-    Returns (fix, n_fix, n_bad): fix is the XOR mask to apply (int32 tile, zero
+    Returns (fix, n_fix, n_bad, n_cw, cw_new): fix is the XOR mask to apply (int32 tile, zero
     when clean). With GATE the expensive element-label syndrome is only computed
     when the overall parity or the bit syndrome of some vector in the tile does
     not match; that misses even-weight errors whose bit labels cancel (two flips
-    at the same bit position of two elements of one vector).
+    at the same bit position of two elements of one vector). n_cw counts vectors
+    whose data is clean but whose stored checkword has a single-bit error;
+    cw_new holds the recomputed checkword there and -1 elsewhere.
     """
     c = tl.reduce(x16, AXIS, _xor).to(tl.int32) & 0xFFFF
     p1 = _par16(c)
@@ -89,6 +91,8 @@ def _check_tile(x16, cw, mask_n, eidx, e_lab, bmask_ptr, inv_e_ptr, inv_b_ptr, A
     fix = x16.to(tl.int32) * 0
     n_fix = tl.sum(mask_n.to(tl.int32), 0) * 0
     n_bad = n_fix
+    n_cw = n_fix
+    cw_new = cw * 0 - 1
     go = True
     if GATE:
         p0 = cw & 1
@@ -104,7 +108,11 @@ def _check_tile(x16, cw, mask_n, eidx, e_lab, bmask_ptr, inv_e_ptr, inv_b_ptr, A
                            1 << tl.expand_dims(bt, AXIS), 0)
             n_fix = tl.sum((st == 1).to(tl.int32), 0)
             n_bad = tl.sum((st == 3).to(tl.int32), 0)
-    return fix, n_fix, n_bad
+            n_cw = tl.sum((st == 2).to(tl.int32), 0)
+            q1 = _par16(se1) ^ _par16(sb1)
+            good = p1 | (se1 << 1) | (sb1 << (1 + E)) | (q1 << (1 + E + B))
+            cw_new = tl.where(st == 2, good, -1)
+    return fix, n_fix, n_bad, n_cw, cw_new
 
 
 @triton.jit
@@ -158,7 +166,7 @@ def _encode_scatter_kernel(buf_ptr, cw_ptr, loc_ptr, elab_ptr, bmask_ptr, stride
 
 @triton.jit
 def _check_fix_inplace_kernel(buf_ptr, cw_ptr, loc_ptr, indptr_ptr, nb, elab_ptr, bmask_ptr, inv_e_ptr,
-                              inv_b_ptr, err_ptr, stride_s, stride_h, H, D: tl.constexpr, E: tl.constexpr,
+                              inv_b_ptr, err_ptr, cwerr_ptr, stride_s, stride_h, H, D: tl.constexpr, E: tl.constexpr,
                               B: tl.constexpr):
     """Check buf[loc[n], h] for n < indptr[nb]; fix single data-bit errors in place."""
     n = tl.program_id(0)
@@ -179,6 +187,12 @@ def _check_fix_inplace_kernel(buf_ptr, cw_ptr, loc_ptr, indptr_ptr, nb, elab_ptr
             tl.atomic_add(err_ptr + 0, 1)
         if st == 3:
             tl.atomic_add(err_ptr + 1, 1)
+        if st == 2:
+            # data is clean, the stored checkword took the hit: rewrite it
+            q1 = _par16(se1) ^ _par16(sb1)
+            good = p1 | (se1 << 1) | (sb1 << (1 + E)) | (q1 << (1 + E + B))
+            tl.store(cw_ptr + slot * H + h, good.to(tl.int16))
+            tl.atomic_add(cwerr_ptr, 1)
 
 
 # ---- decode stage 1 with check-on-load -------------------------------------------------
@@ -209,6 +223,7 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
     nk_bad = nk_fix
     nv_fix = nk_fix
     nv_bad = nk_fix
+    n_cw = nk_fix
     bad = nk_fix
     if TM == 1 or TM == 2:
         elab_k = tl.load(elab_ptr + offs_d)[:, None]
@@ -236,7 +251,7 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
                 do_k = ((start_n // BLOCK_N + phase) % SAMPLE) == 0
             if do_k:
                 cwk = tl.load(K_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0).to(tl.int32) & 0xFFFF
-                fk, a, b_ = _check_tile(k.to(tl.int16, bitcast=True), cwk, mask_n, offs_d[:, None], elab_k,
+                fk, a, b_, c_, cwk_new = _check_tile(k.to(tl.int16, bitcast=True), cwk, mask_n, offs_d[:, None], elab_k,
                                         bmask_ptr, inv_e_ptr, inv_b_ptr, 0, E, B, TM == 2, POPC)
                 if a + b_ > 0:
                     k = (k.to(tl.int16, bitcast=True).to(tl.int32) ^ fk).to(tl.int16).to(
@@ -246,6 +261,10 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
                         tl.store(K_Buffer + offs_buf_k, k, mask=mask_n[None, :] & mask_d[:, None] & (fk != 0))
                     nk_fix += a
                     nk_bad += b_
+                if c_ > 0:
+                    n_cw += c_
+                    if WB:
+                        tl.store(K_CW + kv_loc * H_KV + cur_kv_head, cwk_new.to(tl.int16), mask=mask_n & (cwk_new >= 0))
         qk = tl.dot(q_k, k)
         qk *= sm_scale_withk
         if logit_cap > 0:
@@ -259,7 +278,7 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
         if TM == 1 or TM == 2:
             if do_k:
                 cwv = tl.load(V_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0).to(tl.int32) & 0xFFFF
-                fv, a, b_ = _check_tile(v.to(tl.int16, bitcast=True), cwv, mask_n, offs_dv[None, :], elab_v,
+                fv, a, b_, c_, cwv_new = _check_tile(v.to(tl.int16, bitcast=True), cwv, mask_n, offs_dv[None, :], elab_v,
                                         bmask_ptr, inv_e_ptr, inv_b_ptr, 1, E, B, TM == 2, POPC)
                 if a + b_ > 0:
                     v = (v.to(tl.int16, bitcast=True).to(tl.int32) ^ fv).to(tl.int16).to(
@@ -268,6 +287,10 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
                         tl.store(V_Buffer + offs_buf_v, v, mask=mask_n[:, None] & mask_dv[None, :] & (fv != 0))
                     nv_fix += a
                     nv_bad += b_
+                if c_ > 0:
+                    n_cw += c_
+                    if WB:
+                        tl.store(V_CW + kv_loc * H_KV + cur_kv_head, cwv_new.to(tl.int16), mask=mask_n & (cwv_new >= 0))
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
         p = tl.exp(qk - n_e_max[:, None])
@@ -277,7 +300,7 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
         e_max = n_e_max
     if TM == 3:
         bad = _sig_bad(xk_acc, ck_acc, bmask_ptr, E, B) | _sig_bad(xv_acc, cv_acc, bmask_ptr, E, B)
-    return acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad
+    return acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad, n_cw
 
 
 @triton.jit
@@ -337,7 +360,7 @@ def _fwd_grouped_kernel_stage1_secded(
             TM: tl.constexpr = 2
         else:
             TM: tl.constexpr = 1
-        acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad = _split(
+        acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad, n_cw = _split(
             q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, cur_batch_kv_start_idx, split_kv_start,
             split_kv_end, cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d, mask_dv,
             stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr, bmask_ptr, inv_e_ptr,
@@ -346,7 +369,7 @@ def _fwd_grouped_kernel_stage1_secded(
             if bad > 0:
                 # optimistic pass saw a signature mismatch somewhere in this split: redo it
                 # with the full per-vector check and correction
-                acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad = _split(
+                acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad, n_cw = _split(
                     q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, cur_batch_kv_start_idx, split_kv_start,
                     split_kv_end, cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d,
                     mask_dv, stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr,
@@ -360,6 +383,8 @@ def _fwd_grouped_kernel_stage1_secded(
         offs_mid_o_1 = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh + split_kv_id * stride_mid_os) // Lv
         tl.store(Att_Lse + offs_mid_o_1, e_max + tl.log(e_sum), mask=mask_h)
         if CHECK:
+            if n_cw > 0:
+                tl.atomic_add(err_ptr + 9, n_cw)
             if nk_fix + nk_bad + nv_fix + nv_bad > 0:
                 tl.atomic_add(err_ptr + 0, nk_fix)
                 tl.atomic_add(err_ptr + 1, nk_bad)
@@ -386,7 +411,7 @@ def _tables(device):
             inv_e=torch.tensor(inv_e, device=device),
             inv_b=torch.tensor(inv_b, device=device),
         )
-        _state["err"] = torch.zeros(9, dtype=torch.int32, device=device)  # [8] = sig redo count
+        _state["err"] = torch.zeros(10, dtype=torch.int32, device=device)  # [8] sig redo, [9] checkword errors
         _state["phase"] = torch.zeros(1, dtype=torch.int32, device=device)
     return _state["tables"]
 
@@ -455,7 +480,7 @@ def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int) -> None:
         return
     _check_fix_inplace_kernel[(n, buf.shape[1])](
         buf, cw, kv_indices, kv_indptr, kv_indptr.numel() - 1, t["elab"], t["bmask"], t["inv_e"],
-        t["inv_b"], _state["err"][err_off:], buf.stride(0), buf.stride(1), buf.shape[1],
+        t["inv_b"], _state["err"][err_off:], _state["err"][9:], buf.stride(0), buf.stride(1), buf.shape[1],
         D=buf.shape[2], E=code.e_bits, B=code.b_bits,
     )
 

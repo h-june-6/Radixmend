@@ -189,3 +189,24 @@ def test_deepest_node_and_checkword_target(tmp_path):
     assert all(torch.equal(x, y) for x, y in zip(data_before, pool.v_buffer))
     assert send(tmp_path, sched, {"op": "revert"})["reverted"] == 1
     assert all(int(t.abs().sum()) == 0 for t in pool.rm_v_cw)
+
+
+def test_deepest_on_token_path_skips_unread_leaf(tmp_path):
+    sched, pool = fake_sched()
+    root = sched.tree_cache.tree_core.root_node
+    parent = Node(torch.arange(10, 14))
+    parent.key = SimpleNamespace(token_ids=[1, 2, 3, 4])
+    child = Node(torch.arange(20, 25))
+    child.key = SimpleNamespace(token_ids=[5, 6, 7, 8, 9])
+    answer = Node(torch.arange(30, 45))  # warm-up's generated answer, deeper but not on the path
+    answer.key = SimpleNamespace(token_ids=[9] * 15)
+    other = Node(torch.arange(50, 52))
+    other.key = SimpleNamespace(token_ids=[7, 7])
+    parent.children = {5: child, 7: other}
+    other.children = {9: answer}
+    root.children = {1: parent}
+    res = send(tmp_path, sched, {"op": "inject_kv", "seed": 2, "kinds": ["v"], "bits": [14],
+                                 "node": "deepest", "tokens": [1, 2, 3, 4, 5, 6, 7, 0]})
+    assert res["node_depth"] == 2 and res["node_tokens"] == 3  # only the reused part of the child
+    assert 20 <= res["flips"][0]["fault"]["slot"] < 23
+    send(tmp_path, sched, {"op": "revert"})
