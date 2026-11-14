@@ -205,7 +205,8 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
            inv_b_ptr, phase_ptr, BLOCK_N: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
            BLOCK_DV: tl.constexpr,
            logit_cap: tl.constexpr, E: tl.constexpr, B: tl.constexpr, TM: tl.constexpr,
-           POPC: tl.constexpr, SAMPLE: tl.constexpr, WB: tl.constexpr = False):
+           POPC: tl.constexpr, SAMPLE: tl.constexpr, WB: tl.constexpr = False, count_ptr=None,
+           DEDUP: tl.constexpr = False, SIGRED: tl.constexpr = False):
     """Attention over one KV split. WB: write corrected words back to the KV buffer. TM: 0 no check, 1 full, 2 gate, 3 signature (no correction).
 
     TM 3 only accumulates, element-wise, the XOR of every K and V word and of the
@@ -231,8 +232,14 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
         if SAMPLE > 1:
             phase = tl.load(phase_ptr)
     if TM == 3:
-        xk_acc = tl.zeros([BLOCK_DMODEL, BLOCK_N], dtype=tl.int16)
-        xv_acc = tl.zeros([BLOCK_N, BLOCK_DV], dtype=tl.int16)
+        # SIGRED: fold each tile to one word per element right away (fewer live registers,
+        # one XOR reduction per tile) instead of keeping a whole tile of accumulators
+        if SIGRED:
+            xk_acc = tl.zeros([BLOCK_DMODEL, 1], dtype=tl.int16)
+            xv_acc = tl.zeros([1, BLOCK_DV], dtype=tl.int16)
+        else:
+            xk_acc = tl.zeros([BLOCK_DMODEL, BLOCK_N], dtype=tl.int16)
+            xv_acc = tl.zeros([BLOCK_N, BLOCK_DV], dtype=tl.int16)
         ck_acc = tl.zeros([BLOCK_N], dtype=tl.int16)
         cv_acc = tl.zeros([BLOCK_N], dtype=tl.int16)
     for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
@@ -242,8 +249,19 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
         offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
         k = tl.load(K_Buffer + offs_buf_k, mask=mask_n[None, :] & (mask_d[:, None]), other=0.0)
         if TM == 3:
-            xk_acc = xk_acc ^ k.to(tl.int16, bitcast=True)
-            ck_acc = ck_acc ^ tl.load(K_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0)
+            ck = tl.load(K_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0)
+            if DEDUP:
+                # slots read by several requests this step were checked once by the pre-pass
+                sh = tl.load(count_ptr + kv_loc, mask=mask_n, other=0) >= 2
+                k16 = tl.where(sh[None, :], 0, k.to(tl.int16, bitcast=True))
+                ck_acc = ck_acc ^ tl.where(sh, 0, ck)
+            else:
+                k16 = k.to(tl.int16, bitcast=True)
+                ck_acc = ck_acc ^ ck
+            if SIGRED:
+                xk_acc = xk_acc ^ tl.reduce(k16, 1, _xor, keep_dims=True)
+            else:
+                xk_acc = xk_acc ^ k16
         if TM == 1 or TM == 2:
             do_k = True
             if SAMPLE > 1:
@@ -273,8 +291,17 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
         offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
         v = tl.load(V_Buffer + offs_buf_v, mask=mask_n[:, None] & (mask_dv[None, :]), other=0.0)
         if TM == 3:
-            xv_acc = xv_acc ^ v.to(tl.int16, bitcast=True)
-            cv_acc = cv_acc ^ tl.load(V_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0)
+            cv = tl.load(V_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0)
+            if DEDUP:
+                v16 = tl.where(sh[:, None], 0, v.to(tl.int16, bitcast=True))
+                cv_acc = cv_acc ^ tl.where(sh, 0, cv)
+            else:
+                v16 = v.to(tl.int16, bitcast=True)
+                cv_acc = cv_acc ^ cv
+            if SIGRED:
+                xv_acc = xv_acc ^ tl.reduce(v16, 0, _xor, keep_dims=True)
+            else:
+                xv_acc = xv_acc ^ v16
         if TM == 1 or TM == 2:
             if do_k:
                 cwv = tl.load(V_CW + kv_loc * H_KV + cur_kv_head, mask=mask_n, other=0).to(tl.int32) & 0xFFFF
@@ -326,7 +353,13 @@ def _fwd_grouped_kernel_stage1_secded(
     logit_cap: tl.constexpr, Lk: tl.constexpr, Lv: tl.constexpr, E: tl.constexpr, B: tl.constexpr,
     CHECK: tl.constexpr, GATE: tl.constexpr = False, POPC: tl.constexpr = False,
     SAMPLE: tl.constexpr = 1, phase_ptr=None, SIG: tl.constexpr = False, WB: tl.constexpr = False,
+    count_ptr=None, DEDUP: tl.constexpr = False, bad_ptr=None, REDO: tl.constexpr = False,
+    SIGRED: tl.constexpr = False,
 ):
+    """SIG keeps only the cheap signature in this kernel and writes a per-program
+    mismatch flag to bad_ptr; a second launch with REDO=True recomputes just the
+    flagged splits with the full check (keeps the correction code, and its
+    registers, out of the hot kernel)."""
     cur_batch = tl.program_id(0).to(tl.int64)
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
@@ -349,11 +382,18 @@ def _fwd_grouped_kernel_stage1_secded(
     kv_len_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-    if split_kv_end > split_kv_start:
+    flag_off = (cur_batch * tl.num_programs(1) + cur_head_id) * tl.num_programs(2) + split_kv_id
+    run = split_kv_end > split_kv_start
+    if REDO:
+        if run:
+            run = tl.load(bad_ptr + flag_off) > 0
+    if run:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
         q_k = q.to(K_Buffer.dtype.element_ty)
         if not CHECK:
             TM: tl.constexpr = 0
+        elif REDO:
+            TM: tl.constexpr = 1
         elif SIG:
             TM: tl.constexpr = 3
         elif GATE:
@@ -364,18 +404,13 @@ def _fwd_grouped_kernel_stage1_secded(
             q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, cur_batch_kv_start_idx, split_kv_start,
             split_kv_end, cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d, mask_dv,
             stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr, bmask_ptr, inv_e_ptr,
-            inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B, TM, POPC, SAMPLE, WB)
-        if SIG:
-            if bad > 0:
-                # optimistic pass saw a signature mismatch somewhere in this split: redo it
-                # with the full per-vector check and correction
-                acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad, n_cw = _split(
-                    q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, cur_batch_kv_start_idx, split_kv_start,
-                    split_kv_end, cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d,
-                    mask_dv, stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr,
-                    bmask_ptr, inv_e_ptr, inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B,
-                    1, POPC, 1, WB)
-                tl.atomic_add(err_ptr + 8, 1)
+            inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B, TM, POPC, SAMPLE, WB, count_ptr, DEDUP, SIGRED)
+        if SIG and not REDO:
+            # mismatch somewhere in this split: the REDO launch recomputes it with the full
+            # per-vector check and correction, overwriting this program's outputs
+            tl.store(bad_ptr + flag_off, bad)
+        if REDO:
+            tl.atomic_add(err_ptr + 8, 1)
 
         offs_mid_o = (cur_batch * stride_mid_ob + cur_head[:, None] * stride_mid_oh
                       + split_kv_id * stride_mid_os + offs_dv[None, :])
@@ -390,6 +425,50 @@ def _fwd_grouped_kernel_stage1_secded(
                 tl.atomic_add(err_ptr + 1, nk_bad)
                 tl.atomic_add(err_ptr + 2, nv_fix)
                 tl.atomic_add(err_ptr + 3, nv_bad)
+
+
+@triton.jit
+def _count_readers_kernel(kv_indices, kv_indptr, bs, count_ptr, owner_ptr, NPROG: tl.constexpr,
+                          BLOCK: tl.constexpr):
+    """count[slot] = readers of slot in this decode step; owner[slot] = first index reading it."""
+    total = tl.load(kv_indptr + bs)
+    for start in tl.range(tl.program_id(0) * BLOCK, total, NPROG * BLOCK):
+        n = start + tl.arange(0, BLOCK)
+        m = n < total
+        slot = tl.load(kv_indices + n, mask=m, other=0).to(tl.int64)
+        tl.atomic_add(count_ptr + slot, 1, mask=m)
+        tl.atomic_min(owner_ptr + slot, n.to(tl.int32), mask=m)
+
+
+@triton.jit
+def _shared_prepass_kernel(buf_ptr, cw_ptr, kv_indices, kv_indptr, bs, count_ptr, owner_ptr, elab_ptr,
+                           bmask_ptr, inv_e_ptr, inv_b_ptr, err_ptr, cwerr_ptr, stride_s, stride_h, H,
+                           NPROG: tl.constexpr, D: tl.constexpr, E: tl.constexpr, B: tl.constexpr):
+    """Full check + in-place fix of each shared slot (count >= 2) once, by its owner index."""
+    h = tl.program_id(1)
+    total = tl.load(kv_indptr + bs)
+    d = tl.arange(0, D)
+    e_lab = tl.load(elab_ptr + d)
+    for n in tl.range(tl.program_id(0), total, NPROG):
+        slot = tl.load(kv_indices + n).to(tl.int64)
+        if tl.load(count_ptr + slot) >= 2:
+            if tl.load(owner_ptr + slot) == n:
+                ptr = buf_ptr + slot * stride_s + h * stride_h
+                x = tl.load(ptr + d).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+                p1, se1, sb1 = _syndrome(x, e_lab, bmask_ptr, 0, B)
+                cw = tl.load(cw_ptr + slot * H + h).to(tl.int32) & 0xFFFF
+                st, el, bt = _status(p1, se1, sb1, cw, inv_e_ptr, inv_b_ptr, E, B)
+                if st == 1:
+                    xe = tl.load(ptr + el).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+                    tl.store(ptr + el, (xe ^ (1 << bt)).to(tl.int16).to(buf_ptr.dtype.element_ty, bitcast=True))
+                    tl.atomic_add(err_ptr + 0, 1)
+                if st == 3:
+                    tl.atomic_add(err_ptr + 1, 1)
+                if st == 2:
+                    q1 = _par16(se1) ^ _par16(sb1)
+                    good = p1 | (se1 << 1) | (sb1 << (1 + E)) | (q1 << (1 + E + B))
+                    tl.store(cw_ptr + slot * H + h, good.to(tl.int16))
+                    tl.atomic_add(cwerr_ptr, 1)
 
 
 # ---- host side ---------------------------------------------------------------------------
@@ -431,6 +510,8 @@ def attach_pool(pool) -> None:
         encode_rows(kb, kc, all_loc)
         encode_rows(vb, vc, all_loc)
     _state["pools"][id(pool)] = pool
+    _state["count"] = torch.zeros(n, dtype=torch.int32, device=dev)
+    _state["owner"] = torch.zeros(n, dtype=torch.int32, device=dev)
 
 
 def encode_rows(buf, cw, loc) -> None:
@@ -447,8 +528,12 @@ def encode_rows(buf, cw, loc) -> None:
 
 def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                   num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap=0.0, check=True,
-                  block_h=16, min_block_kv=32, mode="full", popc=None, sample=1, wb=False):
-    """Grouped decode stage 1 with check-on-load; same outputs as SGLang's stage 1."""
+                  block_h=16, min_block_kv=32, mode="full", popc=None, sample=1, wb=False, dedup=False, sigred=False):
+    """Grouped decode stage 1 with check-on-load; same outputs as SGLang's stage 1.
+
+    dedup (sig mode only): ``shared_prepass`` must have run for this layer; slots
+    with reader count >= 2 are then left out of the signature.
+    """
     t = _tables(k_buffer.device)
     code = _state["code"]
     Lk, Lv = k_buffer.shape[-1], v_buffer.shape[-1]
@@ -456,7 +541,27 @@ def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = head_num // kv_head_num
     grid = (batch, triton.cdiv(head_num, min(block_h, kv_group_num)), max_kv_splits)
-    _fwd_grouped_kernel_stage1_secded[grid](
+    sig = check and mode == "sig"
+    bad = torch.empty(grid[0] * grid[1] * grid[2], dtype=torch.int32, device=q.device) if sig else None
+    _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
+                        num_kv_splits, sm_scale_withk, logit_cap, check, block_h, min_block_kv, mode, popc,
+                        sample, wb, dedup, bad, False, sigred)
+    if sig:
+        _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
+                            num_kv_splits, sm_scale_withk, logit_cap, check, block_h, min_block_kv, mode, popc,
+                            1, wb, False, bad, True, False)
+
+
+def _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
+                        num_kv_splits, sm_scale_withk, logit_cap, check, block_h, min_block_kv, mode, popc,
+                        sample, wb, dedup, bad, redo, sigred=False):
+    t = _state["tables"]
+    code = _state["code"]
+    Lk, Lv = k_buffer.shape[-1], v_buffer.shape[-1]
+    kv_head_num = k_buffer.shape[-2]
+    head_num = q.shape[1]
+    kv_group_num = head_num // kv_head_num
+    h = _fwd_grouped_kernel_stage1_secded[grid](
         q, k_buffer, v_buffer, k_cw, v_cw, sm_scale_withk, kv_indptr, kv_indices, att_out, att_lse,
         num_kv_splits, t["elab"], t["bmask"], t["inv_e"], t["inv_b"], _state["err"],
         q.stride(0), q.stride(1), k_buffer.stride(0), k_buffer.stride(1),
@@ -467,8 +572,37 @@ def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr
         MIN_BLOCK_KV=min_block_kv, logit_cap=logit_cap, Lk=Lk, Lv=Lv,
         E=code.e_bits, B=code.b_bits, CHECK=check, GATE=(mode == "gate"), SIG=(mode == "sig"),
         POPC=(k_buffer.is_cuda if popc is None else popc), SAMPLE=sample, WB=wb,
+        count_ptr=_state["count"] if dedup else None, DEDUP=bool(dedup and mode == "sig"),
+        bad_ptr=bad, REDO=redo, SIGRED=bool(sigred and mode == "sig"),
         phase_ptr=_state["phase"], num_warps=4, num_stages=2,
     )
+    # registers / spills of the compiled kernel (GPU only), for the RQ3 bench
+    _state.setdefault("kinfo", {})[("redo" if redo else mode, bool(wb), bool(dedup), bool(sigred))] = (
+        getattr(h, "n_regs", None), getattr(h, "n_spills", None))
+
+
+_NPROG = 512
+
+
+def count_readers(kv_indices, kv_indptr) -> None:
+    """Once per decode step (same kv_indices for every layer); graph capturable."""
+    _state["count"].zero_()
+    _state["owner"].fill_(2 ** 31 - 1)
+    _count_readers_kernel[(_NPROG,)](kv_indices, kv_indptr, kv_indptr.numel() - 1, _state["count"],
+                                     _state["owner"], NPROG=_NPROG, BLOCK=128)
+
+
+def shared_prepass(k_buffer, v_buffer, k_cw, v_cw, kv_indices, kv_indptr) -> None:
+    """Check every slot read by >= 2 requests once for this layer, fixing in place (decode counters)."""
+    t = _tables(k_buffer.device)
+    code = _state["code"]
+    for buf, cw, off in ((k_buffer, k_cw, 0), (v_buffer, v_cw, 2)):
+        _shared_prepass_kernel[(_NPROG, buf.shape[1])](
+            buf, cw, kv_indices, kv_indptr, kv_indptr.numel() - 1, _state["count"], _state["owner"],
+            t["elab"], t["bmask"], t["inv_e"], t["inv_b"], _state["err"][off:], _state["err"][9:],
+            buf.stride(0), buf.stride(1), buf.shape[1], NPROG=_NPROG, D=buf.shape[2], E=code.e_bits,
+            B=code.b_bits,
+        )
 
 
 def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int) -> None:
@@ -519,6 +653,10 @@ def install() -> None:
     # RADIXMEND_SECDED_WB=1: decode writes corrected words back to the KV buffer, so a
     # fault is fixed once instead of on every step (and cannot pair up with a later flip)
     wb = os.environ.get("RADIXMEND_SECDED_WB") == "1"
+    # RADIXMEND_SECDED_DEDUP=1 (sig mode): slots read by several requests in one decode
+    # step (a shared prompt) are checked once per layer by a pre-pass, not once per request
+    dedup = os.environ.get("RADIXMEND_SECDED_DEDUP") == "1" and mode == "sig" and check
+    sigred = os.environ.get("RADIXMEND_SECDED_SIGRED") == "1"
 
     orig_init = mp.MHATokenToKVPool.__init__
 
@@ -552,10 +690,15 @@ def install() -> None:
         k_cw, v_cw, lid = cws
         if sample > 1 and lid == 0:
             _state["phase"].add_(1)  # one step per forward; capturable in CUDA graphs
+        if dedup:
+            if lid == 0:
+                count_readers(kv_indices, kv_indptr)
+            shared_prepass(k_buffer, v_buffer, k_cw, v_cw, kv_indices, kv_indptr)
         launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                       num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap, check,
                       block_h=da._GROUPED_BLOCK_H, min_block_kv=da._MIN_BLOCK_KV,
-                      mode=mode, popc=popc, sample=sample, wb=wb)
+                      mode=mode, popc=popc, sample=sample, wb=wb, dedup=dedup,
+                      sigred=sigred)
 
     from sglang.kernels.ops.attention import extend_attention as ea
 

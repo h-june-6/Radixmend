@@ -120,7 +120,7 @@ def test_prefix_check_fixes_in_place():
 
 
 # popc needs libdevice, so it only runs on the GPU
-VARIANTS = [dict(mode="full"), dict(mode="gate"), dict(mode="sig")] + (
+VARIANTS = [dict(mode="full"), dict(mode="gate"), dict(mode="sig"), dict(mode="sig", sigred=True)] + (
     [dict(mode="full", popc=True), dict(mode="gate", popc=True)] if torch.cuda.is_available() else [])
 
 
@@ -239,3 +239,45 @@ def test_prefix_check_rewrites_bad_checkword():
     ss.check_fix_inplace(k, kcw, idx, indptr, 4)
     assert ss.errors()[4:6] == [0, 0] and ss.errors()[9] == 1
     assert torch.equal(kcw, good) and torch.equal(k.view(torch.int16), before.view(torch.int16))
+
+
+def shared_setup(shared=40, own=(20, 33), seed=5):
+    g = torch.Generator().manual_seed(seed)
+    k = torch.randn(POOL, H_KV, D, generator=g).to(DT).to(DEV)
+    v = torch.randn(POOL, H_KV, D, generator=g).to(DT).to(DEV)
+    q = torch.randn(len(own), H_KV * GROUP, D, generator=g).to(DT).to(DEV)
+    perm = torch.randperm(POOL, generator=g)
+    pre = perm[:shared]
+    rows, off = [], shared
+    for o in own:
+        rows.append(torch.cat([pre, perm[off:off + o]]))
+        off += o
+    idx = torch.cat(rows).to(torch.int64).to(DEV)
+    lens = [shared + o for o in own]
+    indptr = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device=DEV)
+    return q, k, v, indptr, idx, pre
+
+
+@pytest.mark.parametrize("sigred", [False, True])
+def test_dedup_checks_shared_slots_once(sigred):
+    q, k, v, indptr, idx, pre = shared_setup()
+    kcw, vcw = encode(k), encode(v)
+    ss._state["count"] = torch.zeros(POOL, dtype=torch.int32, device=DEV)
+    ss._state["owner"] = torch.zeros(POOL, dtype=torch.int32, device=DEV)
+    clean = run(q, k, v, kcw, vcw, indptr, idx, 2, check=False)
+    k2, v2 = k.clone(), v.clone()
+    k2.view(torch.int16)[int(pre[7]), 1, 77] ^= 1 << 14      # shared by both requests
+    v2.view(torch.int16)[int(idx[45]), 0, 3] ^= 1 << 7       # request 0 only
+    ss._state["err"].zero_()
+    ss.count_readers(idx, indptr)
+    assert int(ss._state["count"][pre[7]]) == 2 and int(ss._state["count"][idx[45]]) == 1
+    ss.shared_prepass(k2, v2, kcw, vcw, idx, indptr)
+    assert ss.errors()[:4] == [1, 0, 0, 0]                    # shared flip fixed once, in place
+    assert torch.equal(k2.view(torch.int16), k.view(torch.int16))
+    out = run(q, k2, v2, kcw, vcw, indptr, idx, 2, mode="sig", wb=True, dedup=True, sigred=sigred)
+    assert torch.equal(clean[0], out[0]) and torch.equal(clean[1], out[1])
+    e = ss.errors()
+    assert e[:4] == [1, 0, 1, 0] and e[8] == 1                # private flip via one sig redo
+    ss._state["err"].zero_()
+    run(q, k2, v2, kcw, vcw, indptr, idx, 2, mode="sig", wb=True, dedup=True, sigred=sigred)
+    assert ss.errors()[8] == 0
