@@ -3,7 +3,9 @@
 Installs the RadixMend fault-injection hook in every SGLang process
 (including the spawned scheduler) when RADIXMEND_CMD_DIR is set, and the
 module A prototype (SECDED check inside triton decode attention) when
-RADIXMEND_SECDED=1, and the hit-time hash baseline when RADIXMEND_HASH=1.
+RADIXMEND_SECDED=1, module C recovery (retract + recompute on uncorrectable
+errors) when RADIXMEND_RECOVER=1 as well, and the hit-time hash baseline when
+RADIXMEND_HASH=1.
 Does nothing otherwise.
 """
 import os
@@ -24,6 +26,14 @@ if os.environ.get("RADIXMEND_SECDED") == "1":
         secded_install()
     except Exception as e:
         print(f"[radixmend] secded not installed: {e!r}", file=sys.stderr)
+
+    if os.environ.get("RADIXMEND_RECOVER") == "1":
+        try:
+            from radixmend.sglang_recover import install as recover_install
+
+            recover_install()
+        except Exception as e:
+            print(f"[radixmend] recovery not installed: {e!r}", file=sys.stderr)
 
 if os.environ.get("RADIXMEND_HASH") == "1":
     try:

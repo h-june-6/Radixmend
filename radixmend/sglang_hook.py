@@ -344,6 +344,12 @@ def _op_secded_log(sched, cmd):
     return ss.error_log(reset=bool(cmd.get("reset")))
 
 
+def _op_recover_stats(sched, cmd):
+    from radixmend import sglang_recover as sr
+
+    return {"enabled": sr._state["poison"] is not None, **sr.stats(reset=bool(cmd.get("reset")))}
+
+
 def _op_hash_stats(sched, cmd):
     from radixmend import sglang_hash as sh
 
@@ -354,7 +360,7 @@ _OPS = {"tree_info": _op_tree_info, "inject_kv": _op_inject_kv, "revert": _op_re
         "inject_index": _op_inject_index, "cancel": _op_cancel,
         "snapshot_kv": _op_snapshot_kv, "compare_kv": _op_compare_kv,
         "secded_stats": _op_secded_stats, "secded_log": _op_secded_log,
-        "hash_stats": _op_hash_stats}
+        "hash_stats": _op_hash_stats, "recover_stats": _op_recover_stats}
 
 
 def poll(sched, cmd_dir: Path) -> None:
