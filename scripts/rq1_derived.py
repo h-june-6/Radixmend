@@ -25,6 +25,9 @@ them.
     # hash baseline (server with RADIXMEND_HASH=1): flip before the hit, then after it
     python scripts/rq1_derived.py --out results/rq1/derived_hash --kinds v --bits 14,7 --reps 30
     python scripts/rq1_derived.py --out results/rq1/derived_hash_toctou --when decode --kinds v --bits 14,7 --reps 30
+    # module C (server with RADIXMEND_SECDED=1 RADIXMEND_RECOVER=1 --disable-overlap-schedule):
+    # 2-bit error in one vector of the parent, which module A detects but cannot correct
+    python scripts/rq1_derived.py --out results/c/derived_2bit --kinds v --bits-each 14:7,7:3 --reps 30 --turn2 own
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rq1_kv_sweep as kv  # noqa: E402
 
+STAT_OPS = ("hash_stats", "secded_stats", "recover_stats")
 FOLLOW_UP = "Thanks. Can you summarize that in one sentence?"
 
 
@@ -60,13 +64,15 @@ def flow(a, cmd_dir, tok, system, q0, q1, inject, golden=None):
         shared += 1
     kv.flush(a.url)
     kv.generate(a.url, p0, a.warm_new)
-    stats = {op: kv.hook(cmd_dir, {"op": op, "reset": True}) for op in ("hash_stats", "secded_stats")}
+    stats = {op: kv.hook(cmd_dir, {"op": op, "reset": True}) for op in STAT_OPS}
     op = {"op": "inject_kv", **inject, "pos_lo": 0, "pos_hi": shared}
     try:
         if a.when == "decode":
             op["after_tokens"] = a.after_tokens
             cid = send_cmd(cmd_dir, op)
+            t1 = time.monotonic()
             out1 = kv.generate(a.url, p1, a.max_new)
+            t1 = time.monotonic() - t1
             inj = wait_done(cmd_dir, cid, 5.0)
             if inj is None:
                 kv.hook(cmd_dir, {"op": "cancel", "target_id": cid})
@@ -75,10 +81,12 @@ def flow(a, cmd_dir, tok, system, q0, q1, inject, golden=None):
                 raise RuntimeError(inj.get("error"))
         else:
             inj = kv.hook(cmd_dir, op)
+            t1 = time.monotonic()
             out1 = kv.generate(a.url, p1, a.max_new)
+            t1 = time.monotonic() - t1
     finally:
         kv.hook(cmd_dir, {"op": "revert"})
-    stats = {op: kv.hook(cmd_dir, {"op": op}) for op in ("hash_stats", "secded_stats")}
+    stats = {op: kv.hook(cmd_dir, {"op": op}) for op in STAT_OPS}
     # child = turn 1's own tokens; with a decode-time flip also its generated tokens
     # (the last output token has no KV yet)
     gen = out1 if a.when == "decode" else []
@@ -104,8 +112,9 @@ def flow(a, cmd_dir, tok, system, q0, q1, inject, golden=None):
         p2 = chat_ids(tok, sys_msgs + [{"role": "user", "content": q1}, {"role": "assistant", "content": answer},
                                        {"role": "user", "content": FOLLOW_UP}])
     out2 = kv.generate(a.url, p2, a.max_new)
-    stats2 = {op: kv.hook(cmd_dir, {"op": op}) for op in ("hash_stats", "secded_stats")}
-    return out1, out2, cmp, inj.get("flips", []), shared, len(p1), answer, {"turn1": stats, "after_turn2": stats2}
+    stats2 = {op: kv.hook(cmd_dir, {"op": op}) for op in STAT_OPS}
+    return out1, out2, cmp, inj.get("flips", []), shared, len(p1), answer, {"turn1": stats, "after_turn2": stats2,
+                                                                      "turn1_seconds": round(t1, 4)}
 
 
 def send_cmd(cmd_dir: Path, op: dict) -> str:
@@ -136,6 +145,9 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--kinds", default="v")
     ap.add_argument("--bits", default="14")
+    ap.add_argument("--bits-each", default="",
+                    help='comma-separated "a:b" pairs: flip bit a of one element and bit b of another in '
+                         'the same vector (a 2-bit error that module A detects but cannot correct)')
     ap.add_argument("--reps", type=int, default=30)
     ap.add_argument("--warm-new", type=int, default=16)
     ap.add_argument("--max-new", type=int, default=64)
@@ -190,14 +202,23 @@ def main() -> None:
     done = set()
     if tpath.exists():
         done = {json.loads(l)["trial"] for l in tpath.read_text().splitlines() if l.strip()}
-    todo = [(k, b, r) for k in a.kinds.split(",") for b in kv.parse_bits(a.bits) for r in range(a.reps)]
+    groups = [p.strip() for p in a.bits_each.split(",") if p.strip()] if a.bits_each else kv.parse_bits(a.bits)
+    todo = [(k, b, r) for k in a.kinds.split(",") for b in groups for r in range(a.reps)]
     todo.sort(key=lambda t: (t[2], t[0], t[1]))
     for kind, bit, rep in todo:
-        tid = f"derived-{kind}-b{bit:02d}-r{rep:03d}"
+        if isinstance(bit, str):
+            pa, pb = (int(x) for x in bit.split(":"))
+            tid = f"derived-{kind}-each{pa:02d}x{pb:02d}-r{rep:03d}"
+        else:
+            tid = f"derived-{kind}-b{bit:02d}-r{rep:03d}"
         if tid in done:
             continue
         seed = int(hashlib.sha256(tid.encode()).hexdigest()[:8], 16)
-        inject = {"seed": seed, "kinds": ["v" if kind == "none" else kind], "bits": [bit], "dry_run": kind == "none"}
+        inject = {"seed": seed, "kinds": ["v" if kind == "none" else kind], "dry_run": kind == "none"}
+        if isinstance(bit, str):
+            inject["bits_each"] = [pa, pb]
+        else:
+            inject["bits"] = [bit]
         rec = {"trial": tid, "kind": kind, "bit": bit, "rep": rep}
         t0 = time.monotonic()
         try:
