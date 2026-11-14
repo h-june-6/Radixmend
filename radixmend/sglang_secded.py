@@ -36,6 +36,7 @@ import triton.language as tl
 from radixmend.secded_vec import VecCode
 
 _state = {"pools": {}, "code": None, "tables": None, "err": None, "by_ptr": {}}
+LOG_CAP = 4096  # error log entries (uncorrectable detections) kept until read
 
 
 # ---- shared jit helpers ---------------------------------------------------------------
@@ -83,7 +84,8 @@ def _check_tile(x16, cw, mask_n, eidx, e_lab, bmask_ptr, inv_e_ptr, inv_b_ptr, A
     not match; that misses even-weight errors whose bit labels cancel (two flips
     at the same bit position of two elements of one vector). n_cw counts vectors
     whose data is clean but whose stored checkword has a single-bit error;
-    cw_new holds the recomputed checkword there and -1 elsewhere.
+    cw_new holds the recomputed checkword there, -2 for uncorrectable vectors
+    and -1 elsewhere.
     """
     c = tl.reduce(x16, AXIS, _xor).to(tl.int32) & 0xFFFF
     p1 = _par16(c)
@@ -111,8 +113,18 @@ def _check_tile(x16, cw, mask_n, eidx, e_lab, bmask_ptr, inv_e_ptr, inv_b_ptr, A
             n_cw = tl.sum((st == 2).to(tl.int32), 0)
             q1 = _par16(se1) ^ _par16(sb1)
             good = p1 | (se1 << 1) | (sb1 << (1 + E)) | (q1 << (1 + E + B))
-            cw_new = tl.where(st == 2, good, -1)
+            cw_new = tl.where(st == 2, good, tl.where(st == 3, -2, -1))  # -2 marks uncorrectable
     return fix, n_fix, n_bad, n_cw, cw_new
+
+
+@triton.jit
+def _log_bad(log_ptr, logn_ptr, CAP, slot, head, tag, mask):
+    """Append (slot, head, tag) for every masked entry to the error log (drops past CAP)."""
+    idx = tl.atomic_add(logn_ptr + slot * 0, mask.to(tl.int32) * 0 + 1, mask=mask)
+    ok = mask & (idx < CAP)
+    tl.store(log_ptr + idx * 3, slot.to(tl.int32), mask=ok)
+    tl.store(log_ptr + idx * 3 + 1, (slot * 0 + head).to(tl.int32), mask=ok)
+    tl.store(log_ptr + idx * 3 + 2, (slot * 0 + tag).to(tl.int32), mask=ok)
 
 
 @triton.jit
@@ -166,8 +178,8 @@ def _encode_scatter_kernel(buf_ptr, cw_ptr, loc_ptr, elab_ptr, bmask_ptr, stride
 
 @triton.jit
 def _check_fix_inplace_kernel(buf_ptr, cw_ptr, loc_ptr, indptr_ptr, nb, elab_ptr, bmask_ptr, inv_e_ptr,
-                              inv_b_ptr, err_ptr, cwerr_ptr, stride_s, stride_h, H, D: tl.constexpr, E: tl.constexpr,
-                              B: tl.constexpr):
+                              inv_b_ptr, err_ptr, cwerr_ptr, stride_s, stride_h, H, log_ptr, logn_ptr, LOGCAP,
+                              tag, D: tl.constexpr, E: tl.constexpr, B: tl.constexpr):
     """Check buf[loc[n], h] for n < indptr[nb]; fix single data-bit errors in place."""
     n = tl.program_id(0)
     h = tl.program_id(1)
@@ -187,6 +199,7 @@ def _check_fix_inplace_kernel(buf_ptr, cw_ptr, loc_ptr, indptr_ptr, nb, elab_ptr
             tl.atomic_add(err_ptr + 0, 1)
         if st == 3:
             tl.atomic_add(err_ptr + 1, 1)
+            _log_bad(log_ptr, logn_ptr, LOGCAP, slot, h, tag, st == 3)
         if st == 2:
             # data is clean, the stored checkword took the hit: rewrite it
             q1 = _par16(se1) ^ _par16(sb1)
@@ -206,7 +219,8 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
            BLOCK_DV: tl.constexpr,
            logit_cap: tl.constexpr, E: tl.constexpr, B: tl.constexpr, TM: tl.constexpr,
            POPC: tl.constexpr, SAMPLE: tl.constexpr, WB: tl.constexpr = False, count_ptr=None,
-           DEDUP: tl.constexpr = False, SIGRED: tl.constexpr = False):
+           DEDUP: tl.constexpr = False, SIGRED: tl.constexpr = False, log_ptr=None, logn_ptr=None,
+           LOGCAP=0, layer=0):
     """Attention over one KV split. WB: write corrected words back to the KV buffer. TM: 0 no check, 1 full, 2 gate, 3 signature (no correction).
 
     TM 3 only accumulates, element-wise, the XOR of every K and V word and of the
@@ -279,6 +293,8 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
                         tl.store(K_Buffer + offs_buf_k, k, mask=mask_n[None, :] & mask_d[:, None] & (fk != 0))
                     nk_fix += a
                     nk_bad += b_
+                    if b_ > 0:
+                        _log_bad(log_ptr, logn_ptr, LOGCAP, kv_loc, cur_kv_head, layer * 4, mask_n & (cwk_new == -2))
                 if c_ > 0:
                     n_cw += c_
                     if WB:
@@ -314,6 +330,8 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
                         tl.store(V_Buffer + offs_buf_v, v, mask=mask_n[:, None] & mask_dv[None, :] & (fv != 0))
                     nv_fix += a
                     nv_bad += b_
+                    if b_ > 0:
+                        _log_bad(log_ptr, logn_ptr, LOGCAP, kv_loc, cur_kv_head, layer * 4 + 2, mask_n & (cwv_new == -2))
                 if c_ > 0:
                     n_cw += c_
                     if WB:
@@ -354,7 +372,7 @@ def _fwd_grouped_kernel_stage1_secded(
     CHECK: tl.constexpr, GATE: tl.constexpr = False, POPC: tl.constexpr = False,
     SAMPLE: tl.constexpr = 1, phase_ptr=None, SIG: tl.constexpr = False, WB: tl.constexpr = False,
     count_ptr=None, DEDUP: tl.constexpr = False, bad_ptr=None, REDO: tl.constexpr = False,
-    SIGRED: tl.constexpr = False,
+    SIGRED: tl.constexpr = False, log_ptr=None, logn_ptr=None, LOGCAP=0, layer=0,
 ):
     """SIG keeps only the cheap signature in this kernel and writes a per-program
     mismatch flag to bad_ptr; a second launch with REDO=True recomputes just the
@@ -404,7 +422,8 @@ def _fwd_grouped_kernel_stage1_secded(
             q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, cur_batch_kv_start_idx, split_kv_start,
             split_kv_end, cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d, mask_dv,
             stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr, bmask_ptr, inv_e_ptr,
-            inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B, TM, POPC, SAMPLE, WB, count_ptr, DEDUP, SIGRED)
+            inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B, TM, POPC, SAMPLE, WB, count_ptr, DEDUP, SIGRED,
+            log_ptr, logn_ptr, LOGCAP, layer)
         if SIG and not REDO:
             # mismatch somewhere in this split: the REDO launch recomputes it with the full
             # per-vector check and correction, overwriting this program's outputs
@@ -443,7 +462,7 @@ def _count_readers_kernel(kv_indices, kv_indptr, bs, count_ptr, owner_ptr, NPROG
 @triton.jit
 def _shared_prepass_kernel(buf_ptr, cw_ptr, kv_indices, kv_indptr, bs, count_ptr, owner_ptr, elab_ptr,
                            bmask_ptr, inv_e_ptr, inv_b_ptr, err_ptr, cwerr_ptr, stride_s, stride_h, H,
-                           NPROG: tl.constexpr, D: tl.constexpr, E: tl.constexpr, B: tl.constexpr):
+                           log_ptr, logn_ptr, LOGCAP, tag, NPROG: tl.constexpr, D: tl.constexpr, E: tl.constexpr, B: tl.constexpr):
     """Full check + in-place fix of each shared slot (count >= 2) once, by its owner index."""
     h = tl.program_id(1)
     total = tl.load(kv_indptr + bs)
@@ -464,6 +483,7 @@ def _shared_prepass_kernel(buf_ptr, cw_ptr, kv_indices, kv_indptr, bs, count_ptr
                     tl.atomic_add(err_ptr + 0, 1)
                 if st == 3:
                     tl.atomic_add(err_ptr + 1, 1)
+                    _log_bad(log_ptr, logn_ptr, LOGCAP, slot, h, tag, st == 3)
                 if st == 2:
                     q1 = _par16(se1) ^ _par16(sb1)
                     good = p1 | (se1 << 1) | (sb1 << (1 + E)) | (q1 << (1 + E + B))
@@ -492,6 +512,8 @@ def _tables(device):
         )
         _state["err"] = torch.zeros(10, dtype=torch.int32, device=device)  # [8] sig redo, [9] checkword errors
         _state["phase"] = torch.zeros(1, dtype=torch.int32, device=device)
+        _state["log"] = torch.zeros(LOG_CAP * 3, dtype=torch.int32, device=device)
+        _state["logn"] = torch.zeros(1, dtype=torch.int32, device=device)
     return _state["tables"]
 
 
@@ -528,7 +550,7 @@ def encode_rows(buf, cw, loc) -> None:
 
 def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                   num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap=0.0, check=True,
-                  block_h=16, min_block_kv=32, mode="full", popc=None, sample=1, wb=False, dedup=False, sigred=False):
+                  block_h=16, min_block_kv=32, mode="full", popc=None, sample=1, wb=False, dedup=False, sigred=False, layer=0):
     """Grouped decode stage 1 with check-on-load; same outputs as SGLang's stage 1.
 
     dedup (sig mode only): ``shared_prepass`` must have run for this layer; slots
@@ -545,16 +567,16 @@ def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr
     bad = torch.empty(grid[0] * grid[1] * grid[2], dtype=torch.int32, device=q.device) if sig else None
     _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                         num_kv_splits, sm_scale_withk, logit_cap, check, block_h, min_block_kv, mode, popc,
-                        sample, wb, dedup, bad, False, sigred)
+                        sample, wb, dedup, bad, False, sigred, layer)
     if sig:
         _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                             num_kv_splits, sm_scale_withk, logit_cap, check, block_h, min_block_kv, mode, popc,
-                            1, wb, False, bad, True, False)
+                            1, wb, False, bad, True, False, layer)
 
 
 def _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                         num_kv_splits, sm_scale_withk, logit_cap, check, block_h, min_block_kv, mode, popc,
-                        sample, wb, dedup, bad, redo, sigred=False):
+                        sample, wb, dedup, bad, redo, sigred=False, layer=0):
     t = _state["tables"]
     code = _state["code"]
     Lk, Lv = k_buffer.shape[-1], v_buffer.shape[-1]
@@ -574,6 +596,7 @@ def _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_ls
         POPC=(k_buffer.is_cuda if popc is None else popc), SAMPLE=sample, WB=wb,
         count_ptr=_state["count"] if dedup else None, DEDUP=bool(dedup and mode == "sig"),
         bad_ptr=bad, REDO=redo, SIGRED=bool(sigred and mode == "sig"),
+        log_ptr=_state["log"], logn_ptr=_state["logn"], LOGCAP=LOG_CAP, layer=layer,
         phase_ptr=_state["phase"], num_warps=4, num_stages=2,
     )
     # registers / spills of the compiled kernel (GPU only), for the RQ3 bench
@@ -592,7 +615,7 @@ def count_readers(kv_indices, kv_indptr) -> None:
                                      _state["owner"], NPROG=_NPROG, BLOCK=128)
 
 
-def shared_prepass(k_buffer, v_buffer, k_cw, v_cw, kv_indices, kv_indptr) -> None:
+def shared_prepass(k_buffer, v_buffer, k_cw, v_cw, kv_indices, kv_indptr, layer: int = 0) -> None:
     """Check every slot read by >= 2 requests once for this layer, fixing in place (decode counters)."""
     t = _tables(k_buffer.device)
     code = _state["code"]
@@ -600,12 +623,13 @@ def shared_prepass(k_buffer, v_buffer, k_cw, v_cw, kv_indices, kv_indptr) -> Non
         _shared_prepass_kernel[(_NPROG, buf.shape[1])](
             buf, cw, kv_indices, kv_indptr, kv_indptr.numel() - 1, _state["count"], _state["owner"],
             t["elab"], t["bmask"], t["inv_e"], t["inv_b"], _state["err"][off:], _state["err"][9:],
-            buf.stride(0), buf.stride(1), buf.shape[1], NPROG=_NPROG, D=buf.shape[2], E=code.e_bits,
+            buf.stride(0), buf.stride(1), buf.shape[1], _state["log"], _state["logn"], LOG_CAP,
+            layer * 4 + off, NPROG=_NPROG, D=buf.shape[2], E=code.e_bits,
             B=code.b_bits,
         )
 
 
-def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int) -> None:
+def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int, tag: int = 1) -> None:
     """Check the prefix slots kv_indices[:kv_indptr[-1]] of one layer buffer, fix in place."""
     t = _tables(buf.device)
     code = _state["code"]
@@ -615,7 +639,7 @@ def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int) -> None:
     _check_fix_inplace_kernel[(n, buf.shape[1])](
         buf, cw, kv_indices, kv_indptr, kv_indptr.numel() - 1, t["elab"], t["bmask"], t["inv_e"],
         t["inv_b"], _state["err"][err_off:], _state["err"][9:], buf.stride(0), buf.stride(1), buf.shape[1],
-        D=buf.shape[2], E=code.e_bits, B=code.b_bits,
+        _state["log"], _state["logn"], LOG_CAP, tag, D=buf.shape[2], E=code.e_bits, B=code.b_bits,
     )
 
 
@@ -624,13 +648,28 @@ def check_prefix(k_buffer, v_buffer, kv_indices, kv_indptr) -> bool:
     cws = _state["by_ptr"].get(k_buffer.data_ptr())
     if cws is None or k_buffer.dim() != 3:
         return False
-    check_fix_inplace(k_buffer, cws[0], kv_indices, kv_indptr, 4)  # always the full check
-    check_fix_inplace(v_buffer, cws[1], kv_indices, kv_indptr, 6)
+    lid = cws[2]
+    check_fix_inplace(k_buffer, cws[0], kv_indices, kv_indptr, 4, lid * 4 + 1)  # always the full check
+    check_fix_inplace(v_buffer, cws[1], kv_indices, kv_indptr, 6, lid * 4 + 3)
     return True
 
 
 def errors() -> list[int]:
     return [] if _state["err"] is None else [int(x) for x in _state["err"].tolist()]
+
+
+def error_log(reset: bool = False) -> dict:
+    """Uncorrectable (2-bit) detections: slot, kv head, layer, K/V, path. For module C."""
+    if _state.get("log") is None:
+        return {"total": 0, "entries": []}
+    n = int(_state["logn"].item())
+    rows = _state["log"][: 3 * min(n, LOG_CAP)].view(-1, 3).tolist()
+    out = {"total": n, "dropped": max(0, n - LOG_CAP),
+           "entries": [{"slot": s, "head": h, "layer": t >> 2, "kind": "v" if t & 2 else "k",
+                        "path": "extend" if t & 1 else "decode"} for s, h, t in rows]}
+    if reset:
+        _state["logn"].zero_()
+    return out
 
 
 def install() -> None:
@@ -693,12 +732,12 @@ def install() -> None:
         if dedup:
             if lid == 0:
                 count_readers(kv_indices, kv_indptr)
-            shared_prepass(k_buffer, v_buffer, k_cw, v_cw, kv_indices, kv_indptr)
+            shared_prepass(k_buffer, v_buffer, k_cw, v_cw, kv_indices, kv_indptr, lid)
         launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                       num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap, check,
                       block_h=da._GROUPED_BLOCK_H, min_block_kv=da._MIN_BLOCK_KV,
                       mode=mode, popc=popc, sample=sample, wb=wb, dedup=dedup,
-                      sigred=sigred)
+                      sigred=sigred, layer=lid)
 
     from sglang.kernels.ops.attention import extend_attention as ea
 

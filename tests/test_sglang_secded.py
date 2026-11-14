@@ -281,3 +281,24 @@ def test_dedup_checks_shared_slots_once(sigred):
     ss._state["err"].zero_()
     run(q, k2, v2, kcw, vcw, indptr, idx, 2, mode="sig", wb=True, dedup=True, sigred=sigred)
     assert ss.errors()[8] == 0
+
+
+def test_error_log_records_uncorrectable():
+    q, k, v, indptr, idx, _ = setup()
+    kcw, vcw = encode(k), encode(v)
+    s1 = int(idx[10])
+    k2 = k.clone()
+    k2.view(torch.int16)[s1, 1, 1] ^= 1 << 6
+    k2.view(torch.int16)[s1, 1, 9] ^= 1 << 3
+    ss.error_log(reset=True)
+    run(q, k2, v, kcw, vcw, indptr, idx, mode="full", layer=7)
+    log = ss.error_log(reset=True)
+    assert log["total"] == 1
+    assert log["entries"][0] == {"slot": s1, "head": 1, "layer": 7, "kind": "k", "path": "decode"}
+    v2 = v.clone()
+    v2.view(torch.int16)[s1, 0, 5] ^= 1 << 14
+    v2.view(torch.int16)[s1, 0, 6] ^= 1 << 14
+    ss.check_fix_inplace(v2, vcw, idx, indptr, 6, tag=3 * 4 + 3)
+    log = ss.error_log(reset=True)
+    assert log["entries"] == [{"slot": s1, "head": 0, "layer": 3, "kind": "v", "path": "extend"}]
+    assert ss.error_log()["total"] == 0

@@ -338,6 +338,12 @@ def _op_secded_stats(sched, cmd):
     return out
 
 
+def _op_secded_log(sched, cmd):
+    from radixmend import sglang_secded as ss
+
+    return ss.error_log(reset=bool(cmd.get("reset")))
+
+
 def _op_hash_stats(sched, cmd):
     from radixmend import sglang_hash as sh
 
@@ -347,7 +353,8 @@ def _op_hash_stats(sched, cmd):
 _OPS = {"tree_info": _op_tree_info, "inject_kv": _op_inject_kv, "revert": _op_revert,
         "inject_index": _op_inject_index, "cancel": _op_cancel,
         "snapshot_kv": _op_snapshot_kv, "compare_kv": _op_compare_kv,
-        "secded_stats": _op_secded_stats, "hash_stats": _op_hash_stats}
+        "secded_stats": _op_secded_stats, "secded_log": _op_secded_log,
+        "hash_stats": _op_hash_stats}
 
 
 def poll(sched, cmd_dir: Path) -> None:
