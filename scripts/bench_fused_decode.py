@@ -54,8 +54,17 @@ def main() -> None:
     ap.add_argument("--shared", type=int, default=0,
                     help="first N positions of every request read the same slots (shared prompt)")
     ap.add_argument("--variants", default=",".join(VARIANTS))
+    ap.add_argument("--cfgs", default="",
+                    help="also time each variant under launch configs 'warps,stages,block_n;...'")
     a = ap.parse_args()
     names = a.variants.split(",")
+    if a.cfgs:
+        for base_name in list(names):
+            for c in a.cfgs.split(";"):
+                w, st, bn = map(int, c.split(","))
+                n = f"{base_name}@{w}w{st}s{bn}n"
+                VARIANTS[n] = {**VARIANTS[base_name], "cfg": {"num_warps": w, "num_stages": st, "block_n": bn}}
+                names.append(n)
     from sglang.kernels.ops.attention import decode_attention as da
 
     dev = "cuda"

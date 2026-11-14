@@ -550,7 +550,8 @@ def encode_rows(buf, cw, loc) -> None:
 
 def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                   num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap=0.0, check=True,
-                  block_h=16, min_block_kv=32, mode="full", popc=None, sample=1, wb=False, dedup=False, sigred=False, layer=0):
+                  block_h=16, min_block_kv=32, mode="full", popc=None, sample=1, wb=False, dedup=False, sigred=False, layer=0,
+                  cfg=None):
     """Grouped decode stage 1 with check-on-load; same outputs as SGLang's stage 1.
 
     dedup (sig mode only): ``shared_prepass`` must have run for this layer; slots
@@ -567,7 +568,7 @@ def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr
     bad = torch.empty(grid[0] * grid[1] * grid[2], dtype=torch.int32, device=q.device) if sig else None
     _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                         num_kv_splits, sm_scale_withk, logit_cap, check, block_h, min_block_kv, mode, popc,
-                        sample, wb, dedup, bad, False, sigred, layer)
+                        sample, wb, dedup, bad, False, sigred, layer, cfg)
     if sig:
         _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                             num_kv_splits, sm_scale_withk, logit_cap, check, block_h, min_block_kv, mode, popc,
@@ -576,7 +577,10 @@ def launch_stage1(q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr
 
 def _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_lse, kv_indptr, kv_indices,
                         num_kv_splits, sm_scale_withk, logit_cap, check, block_h, min_block_kv, mode, popc,
-                        sample, wb, dedup, bad, redo, sigred=False, layer=0):
+                        sample, wb, dedup, bad, redo, sigred=False, layer=0, cfg=None):
+    # cfg: launch config of the main (non-redo) kernel, e.g. {"num_warps": 8, "num_stages": 1,
+    # "block_n": 64}; defaults match SGLang's grouped decode (4, 2, 32)
+    c = {"num_warps": 4, "num_stages": 2, "block_n": 32, **(cfg or {})}
     t = _state["tables"]
     code = _state["code"]
     Lk, Lv = k_buffer.shape[-1], v_buffer.shape[-1]
@@ -590,14 +594,14 @@ def _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_ls
         v_buffer.stride(0), v_buffer.stride(1),
         att_out.stride(0), att_out.stride(1), att_out.stride(2), kv_head_num,
         kv_group_num=kv_group_num, q_head_num=head_num, BLOCK_DMODEL=triton.next_power_of_2(Lk),
-        BLOCK_DV=triton.next_power_of_2(Lv), BLOCK_N=32, BLOCK_H=block_h,
+        BLOCK_DV=triton.next_power_of_2(Lv), BLOCK_N=c["block_n"], BLOCK_H=block_h,
         MIN_BLOCK_KV=min_block_kv, logit_cap=logit_cap, Lk=Lk, Lv=Lv,
         E=code.e_bits, B=code.b_bits, CHECK=check, GATE=(mode == "gate"), SIG=(mode == "sig"),
         POPC=(k_buffer.is_cuda if popc is None else popc), SAMPLE=sample, WB=wb,
         count_ptr=_state["count"] if dedup else None, DEDUP=bool(dedup and mode == "sig"),
         bad_ptr=bad, REDO=redo, SIGRED=bool(sigred and mode == "sig"),
         log_ptr=_state["log"], logn_ptr=_state["logn"], LOGCAP=LOG_CAP, layer=layer,
-        phase_ptr=_state["phase"], num_warps=4, num_stages=2,
+        phase_ptr=_state["phase"], num_warps=c["num_warps"], num_stages=c["num_stages"],
     )
     # registers / spills of the compiled kernel (GPU only), for the RQ3 bench
     _state.setdefault("kinfo", {})[("redo" if redo else mode, bool(wb), bool(dedup), bool(sigred))] = (
@@ -696,6 +700,11 @@ def install() -> None:
     # step (a shared prompt) are checked once per layer by a pre-pass, not once per request
     dedup = os.environ.get("RADIXMEND_SECDED_DEDUP") == "1" and mode == "sig" and check
     sigred = os.environ.get("RADIXMEND_SECDED_SIGRED") == "1"
+    # RADIXMEND_SECDED_CFG="warps,stages,block_n" for the main decode kernel (RQ3 tuning)
+    cfg = None
+    if os.environ.get("RADIXMEND_SECDED_CFG"):
+        w, st, bn = map(int, os.environ["RADIXMEND_SECDED_CFG"].split(","))
+        cfg = {"num_warps": w, "num_stages": st, "block_n": bn}
 
     orig_init = mp.MHATokenToKVPool.__init__
 
@@ -737,7 +746,7 @@ def install() -> None:
                       num_kv_splits, max_kv_splits, sm_scale_withk, logit_cap, check,
                       block_h=da._GROUPED_BLOCK_H, min_block_kv=da._MIN_BLOCK_KV,
                       mode=mode, popc=popc, sample=sample, wb=wb, dedup=dedup,
-                      sigred=sigred, layer=lid)
+                      sigred=sigred, layer=lid, cfg=cfg)
 
     from sglang.kernels.ops.attention import extend_attention as ea
 
