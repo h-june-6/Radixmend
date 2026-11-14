@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
@@ -78,6 +79,11 @@ def test_write_back_skips_identical_slots():
     assert sr.first_poisoned(torch.tensor([3])) == 0  # same slot: nothing recomputed
 
 
+@dataclass(kw_only=True, slots=True, frozen=True)
+class Proc:  # like SGLang's SchedulerBatchResultProcessor
+    enable_overlap: bool = False
+
+
 class Req:
     def __init__(self, name, done=False):
         self.name, self.done, self.is_retracted = name, done, False
@@ -107,7 +113,7 @@ def test_handle_step_retracts_only_affected_requests():
     a, b, c = Req("a"), Req("b"), Req("c", done=True)
     batch, r2t, released, kept = fake_batch([a, b, c], [[1, 2, 3], [4, 5], [5, 6]])
     queued, seen = [], {}
-    proc = SimpleNamespace(enable_overlap=False)
+    proc = Proc()
 
     def run_orig():  # SGLang's commit: must see the victims as retracted (overlap path for decode)
         seen.update(a=a.is_retracted, b=b.is_retracted, overlap=proc.enable_overlap)

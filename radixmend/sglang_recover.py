@@ -167,11 +167,14 @@ def handle_step(sched, batch, run_orig) -> None:
     for r in victims:
         r.is_retracted = True  # SGLang then skips the step's commit for these requests
     if victims and batch.forward_mode.is_decode():
-        proc.enable_overlap = True  # the decode loop honours is_retracted only in overlap mode
+        # the decode loop honours is_retracted only in overlap mode; the processor is a
+        # frozen dataclass, so bypass its __setattr__ (the flag is read only at that check)
+        object.__setattr__(proc, "enable_overlap", True)
     try:
         run_orig()
     finally:
-        proc.enable_overlap = old_overlap
+        if proc.enable_overlap != old_overlap:
+            object.__setattr__(proc, "enable_overlap", old_overlap)
     if not victims:
         return
     for r in victims:
