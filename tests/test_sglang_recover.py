@@ -139,3 +139,12 @@ def test_handle_step_without_errors_just_runs():
                             batch_result_processor=SimpleNamespace(enable_overlap=False))
     sr.handle_step(sched, batch, lambda: calls.append(1))
     assert calls == [1] and not released
+
+
+def test_log_fake_feeds_new_bad_slots():
+    make_pool()
+    ss._state["log"] = torch.zeros(ss.LOG_CAP * 3, dtype=torch.int32)
+    ss._state["logn"] = torch.zeros(1, dtype=torch.int32)
+    assert ss.log_fake([(7, 0, 2), (9, 1, 6)]) == 2
+    assert ss.error_log()["total"] == 2
+    assert sr.new_bad_slots().tolist() == [7, 9]

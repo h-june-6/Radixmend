@@ -14,6 +14,7 @@ with ``--disable-overlap-schedule``:
 - module A only: RADIXMEND_SECDED=1 -> blast radius = requests whose output changed.
 
     python scripts/rq4_blast.py --out results/rq4/c_n8 --n 8 --when decode --reps 20
+    python scripts/rq4_blast.py --out results/rq4/c_n8_fake --n 8 --when decode --kinds fake --reps 5
     python scripts/rq4_blast.py --out results/rq4/c_n8 --summarize
 """
 
@@ -172,8 +173,11 @@ def main() -> None:
         if tid in done:
             continue
         seed = int(hashlib.sha256(tid.encode()).hexdigest()[:8], 16)
-        inject = {"seed": seed, "kinds": ["v" if kind == "none" else kind], "bits_each": [pa, pb],
-                  "dry_run": kind == "none"}
+        # kind "none": no flip; kind "fake": no flip, but the sampled vector is reported to
+        # module A's error log as uncorrectable, so module C retracts and recomputes anyway
+        # (separates recompute-path effects from residual contamination)
+        inject = {"seed": seed, "kinds": ["v" if kind in ("none", "fake") else kind], "bits_each": [pa, pb],
+                  "dry_run": kind == "none", "fake_detect": kind == "fake"}
         rec = {"trial": tid, "kind": kind, "bits": bits, "rep": rep, "n": a.n, "when": a.when}
         try:
             outs, secs, wall, inj, stats = trial(a, cmd_dir, warm, prompts, shared, inject)

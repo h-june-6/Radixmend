@@ -677,6 +677,20 @@ def error_log(reset: bool = False) -> dict:
     return out
 
 
+def log_fake(entries) -> int:
+    """Append (slot, head, tag) rows to the error log as if the check had found them
+    uncorrectable, without touching the data (control runs for module C)."""
+    if _state.get("log") is None:
+        raise RuntimeError("error log missing: start the server with RADIXMEND_SECDED=1")
+    n = int(_state["logn"].item())
+    rows = [e for e in entries][: max(0, LOG_CAP - n)]
+    if rows:
+        t = torch.tensor(rows, dtype=torch.int32, device=_state["log"].device).flatten()
+        _state["log"][3 * n: 3 * n + t.numel()] = t
+        _state["logn"] += len(rows)
+    return len(rows)
+
+
 def install() -> None:
     if os.environ.get("RADIXMEND_SECDED") != "1":
         return

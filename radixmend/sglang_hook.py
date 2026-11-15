@@ -136,6 +136,14 @@ def _op_inject_kv(sched, cmd):
     if cmd.get("target", "data") == "cw":
         # flip bits of the module A checkwords instead of the data (data must survive)
         recs = _flip_checkwords(pool, faults, bool(cmd.get("dry_run")))
+    elif cmd.get("fake_detect"):
+        # control for module C: report the sampled vectors as uncorrectable to module A's
+        # error log without flipping anything, so module C retracts and recomputes as usual
+        from radixmend import sglang_secded as ss
+
+        seen = sorted({(f.slot, f.head, f.layer * 4 + (2 if f.kind == "v" else 0)) for f in faults})
+        ss.log_fake(seen)
+        recs = [{"target": "kv", "fault": asdict(f), "dry_run": True, "fake_detect": True} for f in faults]
     elif cmd.get("dry_run"):
         recs = [{"target": "kv", "fault": asdict(f), "dry_run": True} for f in faults]
     else:
