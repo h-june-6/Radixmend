@@ -579,7 +579,7 @@ def _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_ls
                         num_kv_splits, sm_scale_withk, logit_cap, check, block_h, min_block_kv, mode, popc,
                         sample, wb, dedup, bad, redo, sigred=False, layer=0, cfg=None):
     # cfg: launch config of the main (non-redo) kernel, e.g. {"num_warps": 8, "num_stages": 1,
-    # "block_n": 64}; defaults match SGLang's grouped decode (4, 2, 32)
+    # "block_n": 64}; SGLang's grouped decode uses (4, 2, 32)
     # default (4,1,32): RQ3 week-8 sweep, stage 1 1.79x -> 1.13x of SGLang at gsp c32, TPOT c8/c32 +2.4/+2.2%
     c = {"num_warps": 4, "num_stages": 1, "block_n": 32, **(cfg or {})}
     t = _state["tables"]
