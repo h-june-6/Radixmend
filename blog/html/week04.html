@@ -1,7 +1,7 @@
 <!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 4주차] 인덱스를 뒤집으면 서버가 죽고, 부모를 고쳐도 자식은 안 고쳐진다</title></head>
+<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 4주차] 부모를 고쳐도 자식은 그대로 틀려 있었다</title></head>
 <body style="max-width:820px;margin:40px auto;padding:0 16px;font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#222;">
-<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 4주차] 인덱스를 뒤집으면 서버가 죽고, 부모를 고쳐도 자식은 안 고쳐진다</h1>
+<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 4주차] 부모를 고쳐도 자식은 그대로 틀려 있었다</h1>
 <p style="font-size:16px;line-height:1.8;margin:12px 0;">4주차에는 세 가지를 쟀다. 결함 위치가 sink인지 아닌지에 따라 영향이 다른지, KV 값이 아니라 slot 번호(인덱스)를 뒤집으면 어떻게 되는지, 그리고 파생 오염이 실제로 생기는지. 해시 기법 이식도 시작했는데 그건 5주차 글에 같이 쓴다.</p>
 <h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">sink가 특별히 약하다는 가설은 안 맞았다</h2>
 <p style="font-size:16px;line-height:1.8;margin:12px 0;">attention sink(시퀀스 앞 몇 토큰)는 모든 토큰이 attention을 많이 주는 자리라, 거기가 깨지면 피해가 더 클 거라고 생각했다. 설계에서도 모듈 D(사본)를 sink 위주로 생각하고 있었다. V 비트 13, 14를 앞 4토큰과 나머지 860토큰에 각각 50회씩 넣었다.</p>

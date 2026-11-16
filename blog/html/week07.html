@@ -1,7 +1,7 @@
 <!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 7주차] 싸게 검사하는 방법을 네 개 만들었고, 그중 둘은 생성 중 주입에서 무너졌다</title></head>
+<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 7주차] 샘플링 검사는 생성 중 오류를 못 막았다</title></head>
 <body style="max-width:820px;margin:40px auto;padding:0 16px;font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#222;">
-<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 7주차] 싸게 검사하는 방법을 네 개 만들었고, 그중 둘은 생성 중 주입에서 무너졌다</h1>
+<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 7주차] 샘플링 검사는 생성 중 오류를 못 막았다</h1>
 <p style="font-size:16px;line-height:1.8;margin:12px 0;">6주차 끝에 decode 검사가 공유 프롬프트 동시 32에서 TPOT +81%였다. 7주차에는 이걸 줄이면서 모듈 A를 마무리하고, 교정률과 탐지율(RQ2)을 쟀다.</p>
 <h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">덜 계산하거나, 덜 자주 검사하거나</h2>
 <p style="font-size:16px;line-height:1.8;margin:12px 0;">비용 대부분은 S_e 계산이다. 원소 128개마다 패리티를 구하고, 패리티가 1인 원소의 라벨을 XOR로 모은다. 나머지(전체 패리티 P와 비트 신드롬 S_b)는 원소 128개를 XOR로 접은 값 하나로 계산할 수 있어서 싸다. 그래서 변형을 몇 개 만들었다.</p>
