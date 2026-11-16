@@ -94,7 +94,7 @@ def poison(slots: torch.Tensor) -> None:
 def unpoison_written(loc: torch.Tensor) -> None:
     """A slot that gets new K/V is no longer poisoned (reallocated after a free)."""
     if _state["n_poisoned"]:
-        _state["poison"][loc.to(torch.int64)] = False
+        _state["poison"].index_fill_(0, loc.to(torch.int64), False)
 
 
 def first_poisoned(slots: torch.Tensor) -> int:

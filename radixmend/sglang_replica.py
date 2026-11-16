@@ -67,7 +67,7 @@ def rep() -> dict | None:
 
 
 def invalidate(loc: torch.Tensor) -> None:
-    """Drop the replicas of slots that are being overwritten (no host sync)."""
+    """Drop the replicas of slots that are being overwritten (no host sync, no host tensors)."""
     r = rep()
     if r is None or loc.numel() == 0:
         return
@@ -76,7 +76,7 @@ def invalidate(loc: torch.Tensor) -> None:
     # owner[rs] = -1 where rs >= 0; rows with rs < 0 rewrite owner[0] with its own value
     idx = rs.clamp(min=0)
     r["owner"].index_put_((idx,), torch.where(rs >= 0, torch.full_like(rs, -1), r["owner"][idx]))
-    r["map"][loc] = -1
+    r["map"].index_fill_(0, loc, -1)  # no host scalar tensor: capturable in CUDA graphs
 
 
 def replicate(pool, slots: torch.Tensor) -> int:
