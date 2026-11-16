@@ -2,7 +2,7 @@
 <html lang="ko"><head><meta charset="utf-8"><title>RadixMend 블로그 글 목차</title></head>
 <body style="max-width:820px;margin:40px auto;padding:0 16px;font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#222;">
 <h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">RadixMend 블로그 글 목차</h1>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">GPU 실험 전까지 한 작업을 WBS 16주 계획의 주차에 맞춰 나눈 글들이다. "선행"이 붙은 글은 그 주차 계획 중 GPU 없이 할 수 있는 부분만 먼저 했다는 뜻이다. 각 글에는 작업하면서 막혔던 문제와 푼 방법(트러블슈팅), 남은 일이 들어 있다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">WBS 16주 계획의 주차에 맞춰 나눈 글들이다. 3주차부터는 서버에서 실험한 내용이다. "선행"이 붙은 글은 그 주차 계획 중 GPU 없이 할 수 있는 부분만 먼저 했다는 뜻이다. 각 글에는 작업하면서 막혔던 문제와 푼 방법(트러블슈팅), 남은 일이 들어 있다.</p>
 <table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
 <thead>
 <tr class="header">
@@ -25,7 +25,7 @@
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">1</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">준비 및 기준선 구축</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><a href="week01.html">week01.md</a></td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">SGLang v0.5.22 고정(3주차에 v0.5.19로 변경), 코드 분석, Triton 백엔드 선정, 실험 환경·워크로드 명세, 결함 주입기 착수</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">SGLang v0.5.22 고정, 코드 분석, Triton 백엔드 선정, 실험 환경·워크로드 명세, 결함 주입기 착수</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">서버에서 모델 실행, 재현 스크립트 완성</td>
 </tr>
 <tr class="odd">
@@ -36,18 +36,46 @@
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">무결함 기준선 측정, 주입기 서버 연동</td>
 </tr>
 <tr class="even">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">3 (선행)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">3</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">영향 분석 및 리스크 확인</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><a href="week03.html">week03.md</a></td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">encode / 읽기 시점 교정 / scrub Triton 커널, CPU 인터프리터로 정확성 검증. 실험 서버(CUDA 12.2)에 맞춰 SGLang v0.5.19로 변경, 시행 규모 축소</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">커널 오버헤드 선측정, K·V 비트 위치별 영향</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">서버 설치 트러블슈팅(CUDA 툴킷, JIT, 쿼터), 버전 하향 후 복귀, 결정적 모드, V 비트별 영향 800회, 커널 오버헤드 선측정, 시행 축소</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"></td>
 </tr>
 <tr class="odd">
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">5 (선행)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">4</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">영향 분석</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><a href="week04.html">week04.md</a></td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">sink 대 나머지 위치, 인덱스 비트 반전(RQ1-5), 파생 오염 재현(RQ1-6), 성능 기준선</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"></td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">5</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">영향 분석 정리 및 설계 확정</td>
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><a href="week05.html">week05.md</a></td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">3비트 오교정률 수치화, E=9 설계 변경 제안, 코드 분석 기반 설계 변경점, 비교 실험 절차서 초안</td>
-<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">RQ1, 해시 기법 이식과 파생 오염 재현</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">해시 기법 이식과 되쓰기 버그, TOCTOU, RQ1 정리와 설계 변경, HW ECC 실측 제외</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"></td>
+</tr>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">6</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">구현 (모듈 A)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><a href="week06.html">week06.md</a></td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">체크워드 버퍼, decode 커널 융합, extend 사전 검사, 첫 비용 측정</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"></td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">7</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">구현 (모듈 A)</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><a href="week07.html">week07.md</a></td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">gate·popc·샘플링·sig 변형, 생성 중 주입, 되쓰기, RQ2 교정·탐지율</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"></td>
+</tr>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">8</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">decode 검사 비용 줄이기</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><a href="week08.html">week08.md</a></td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">재계산 launch 분리(레지스터 255→96), 버린 시도, launch 설정 조정, 모듈 A 파생 오염 실험</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"></td>
 </tr>
 <tr class="even">
 <td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">11 (선행)</td>
@@ -65,5 +93,5 @@
 </tr>
 </tbody>
 </table>
-<p style="font-size:16px;line-height:1.8;margin:12px 0;">4, 6~10, 12~14, 16주차는 GPU 실험이나 SGLang 패치가 필요해서 아직 글이 없다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">9, 10, 12~14, 16주차 글은 아직 없다.</p>
 </body></html>
