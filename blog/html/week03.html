@@ -1,7 +1,7 @@
 <!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 3주차] 비트 하나가 출력을 얼마나 바꾸는지 처음 재 봤다</title></head>
+<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 3주차] GPU 서버 환경 구축과 K·V 비트 위치별 출력 변화율 측정</title></head>
 <body style="max-width:820px;margin:40px auto;padding:0 16px;font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#222;">
-<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 3주차] 비트 하나가 출력을 얼마나 바꾸는지 처음 재 봤다</h1>
+<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 3주차] GPU 서버 환경 구축과 K·V 비트 위치별 출력 변화율 측정</h1>
 <p style="font-size:16px;line-height:1.8;margin:12px 0;">3주차 계획은 두 가지였다. K/V 텐서에서 비트 위치마다 영향이 얼마나 다른지 재는 것, 그리고 검사 커널 프로토타입으로 오버헤드를 미리 재 보는 것. 둘 다 GPU가 있어야 하는 일이라 서버를 받고 나서야 제대로 시작할 수 있었다.</p>
 <h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">버전을 내렸다가 다시 올렸다</h2>
 <p style="font-size:16px;line-height:1.8;margin:12px 0;">서버 이야기부터 해야 한다. 대학교 공용 서버 안내에 CUDA 12.2라고 적혀 있었다. SGLang v0.5.22는 CUDA 13 빌드만 있어서 드라이버 580 이상이 필요하다. 12.2면 드라이버가 535 근처일 거라고 생각했고, 그래서 CUDA 12 빌드가 있는 마지막 버전인 v0.5.19로 내렸다. 코드 분석 문서도 v0.5.19 기준으로 다시 맞춰 놓고 차이 문서까지 따로 썼다.</p>
