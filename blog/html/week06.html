@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><title>[RadixMend 6주차] 모듈 A를 attention 커널 안에 넣었는데, 고쳤다는 카운터만 오르고 출력은 그대로 망가졌다</title></head>
+<body style="max-width:820px;margin:40px auto;padding:0 16px;font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#222;">
+<h1 style="font-size:28px;font-weight:700;line-height:1.4;margin:32px 0 16px;">[RadixMend 6주차] 모듈 A를 attention 커널 안에 넣었는데, 고쳤다는 카운터만 오르고 출력은 그대로 망가졌다</h1>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">6주차부터 구현이다. 모듈 A는 KV를 저장할 때 체크워드를 만들어 두고, attention이 KV를 읽을 때 그 자리에서 검사해서 1비트 오류는 레지스터에서 고치는 모듈이다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">체크워드 버퍼와 저장 시 인코딩</h2>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">체크워드는 (slot, KV 헤드)마다 int16 하나, 레이어마다 K와 V에 따로 둔다. Qwen3-8B 기준으로 GPU 메모리가 200 MiB 늘었고, KV 풀 크기(180,040토큰)는 그대로였다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">인코딩은 SGLang의 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">set_kv_buffer</code>를 감싸서, KV를 쓴 직후에 방금 쓴 행을 다시 읽어 체크워드를 계산하는 별도 Triton 커널로 했다. 원래는 저장 커널 안에 합칠 생각이었는데, 따로 돌려도 TPOT가 0.3~0.7%밖에 안 늘어서 합치는 건 미뤘다. 합치면 저장과 인코딩 사이의 아주 짧은 틈이 없어지긴 하지만, 지금 우선순위는 아니다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">decode 커널에 검사 넣기</h2>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">SGLang triton 백엔드의 grouped decode stage 1 커널(<code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">_fwd_grouped_kernel_stage1</code>)을 복사해서, K/V 타일을 읽은 바로 다음에 신드롬을 계산하고 1비트 오류면 그 자리에서 XOR로 고치게 했다. 원래 커널을 몽키패치로 바꿔치기하는 방식이라 SGLang 소스는 건드리지 않는다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">3주차에 독립 커널로 만들 때는 벡터 하나가 행 하나였는데, decode 커널에서 K 타일은 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">[BLOCK_DMODEL, BLOCK_N]</code> 모양이라 열 하나가 벡터 하나다. V 타일은 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">[BLOCK_N, BLOCK_DV]</code>라 반대다. 그래서 신드롬 리덕션 방향을 K와 V에서 다르게 줘야 했다(<code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">AXIS</code> 인자). 방향을 하나라도 잘못 주면 다른 벡터의 원소를 고쳐 버리니까, 테스트에서 K와 V에 각각 오류를 하나씩 넣고 출력이 깨끗한 결과와 비트 단위로 같은지를 따로 확인했다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">로컬에는 GPU가 없어서 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">TRITON_INTERPRET=1</code>로 테스트를 돌렸는데, 인터프리터에서 bf16 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">tl.dot</code>이 제대로 동작하지 않았다. 테스트는 인터프리터에서는 fp16으로, GPU에서는 bf16으로 돌게 나눴다. 서버에서 GPU 테스트 38개가 다 통과했고, 결함이 없을 때 출력은 모듈 A를 켜든 끄든 비트 단위로 같았다. golden ID도 <code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">94c11b0adbc5</code> 그대로였다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">고쳤다는데 왜 출력이 바뀌지</h2>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">RQ1-2와 같은 흐름으로 V 비트 하나를 뒤집고 10회씩 돌렸다.</p>
+<table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
+<thead>
+<tr class="header">
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">V 비트</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">무보호</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">decode 검사만</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">14</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">95%</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;">9/10</strong></td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">7</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">69%</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">6/10</td>
+</tr>
+</tbody>
+</table>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">거의 안 막혔다. 이상한 건 카운터였다. decode 교정 카운터가 비트 14에서 2,451, 비트 7에서 2,198이었다. 오류는 시행당 하나인데 교정이 수천 번 일어났다고 나온다. 이건 오류를 한 번 고친 게 아니라, 같은 오류를 읽을 때마다 레지스터에서 고치고 메모리는 그대로 두니 step마다, 레이어 split마다 계속 다시 고친 횟수였다. 읽기 횟수를 센 셈이다.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">그럼 매번 고쳐서 읽는데 출력이 왜 바뀌나. 바뀐 시행을 하나씩 보니 전부 후속 응답의 <strong style="font-weight:700;">첫 토큰</strong>부터 달랐다. 첫 토큰은 decode가 아니라 prefill에서 나온다. 후속 요청이 공유 prefix를 hit해서 가져오면, 새로 들어온 질문 토큰들을 prefill하는 extend attention이 공유 prefix의 KV를 읽는다. 그 경로에는 아직 검사가 없었다. 깨진 prefix를 extend가 그대로 읽어 첫 토큰부터 틀리고, 그다음부터는 decode가 아무리 고쳐 읽어도 이미 늦은 거다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">extend 앞에 검사 넣기</h2>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">extend attention 커널(<code style="background:#f0f2f4;border-radius:4px;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:0.9em;">_fwd_kernel</code>)은 prefix 단계와 새 토큰 단계가 섞여 있어서 안에 검사를 넣기가 decode보다 훨씬 복잡하다. 그래서 다른 방법을 택했다. extend attention이 불리기 직전에, 그 레이어에서 읽을 prefix slot을 전부 검사하는 커널을 따로 돌리고, 1비트 오류는 <strong style="font-weight:700;">메모리에 바로 고쳐 쓴다</strong>.</p>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">3주차에는 메모리를 커널 안에서 바로 고치면 안 된다고 했었다. 여러 CTA가 같은 벡터를 동시에 읽고 고치다 꼬일 수 있어서다. 그런데 이 사전 검사는 attention과 분리된 커널이고 slot마다 프로그램 하나가 맡으니 그 걱정이 없다. 한 번 고치면 extend도, 그 뒤의 decode도 깨끗한 값을 읽는다.</p>
+<table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
+<thead>
+<tr class="header">
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">V 비트</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">decode 검사만</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">decode + extend 검사</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">14</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">9/10</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;">0/10</strong></td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">7</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">6/10</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;"><strong style="font-weight:700;">0/10</strong></td>
+</tr>
+</tbody>
+</table>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">카운터를 보면 extend 쪽에서 V 교정이 시행마다 정확히 1번씩, 10번이었다. decode 쪽은 0. extend가 먼저 고쳐 놓으니 decode는 고칠 게 없다. 10회로 0%라고 말하긴 이르지만(신뢰구간 상한이 28%) 방향은 확실했다.</p>
+<h2 style="font-size:22px;font-weight:700;line-height:1.4;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid #ddd;">비용</h2>
+<table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6;">
+<thead>
+<tr class="header">
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">워크로드</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">인코딩만</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">+ decode 검사</th>
+<th style="border:1px solid #ccc;background:#f0f0f0;padding:8px 10px;text-align:left;font-weight:700;">+ extend 검사</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">공유 프롬프트 동시 1</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+0.5%</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+7.5%</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+7.5%</td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">공유 프롬프트 동시 8</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+0.5%</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+19.5%</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+19.5%</td>
+</tr>
+<tr class="odd">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">공유 프롬프트 동시 32</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+0.3%</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+80.7%</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+81.0%</td>
+</tr>
+<tr class="even">
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">무작위 동시 32</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+0.5%</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+10.8%</td>
+<td style="border:1px solid #ccc;padding:8px 10px;vertical-align:top;">+11.0%</td>
+</tr>
+</tbody>
+</table>
+<p style="font-size:16px;line-height:1.8;margin:12px 0;">extend 검사는 0.3%p도 안 든다. 문제는 decode 검사다. 공유 프롬프트가 길고(요청당 약 2,300토큰) 동시성이 높을수록 decode가 매 step 읽는 KV가 많아지고, 그만큼 신드롬 계산이 늘어서 c32에서 81%가 나왔다. 3주차 선측정에서 걱정했던 게 그대로 나왔다. 목표 3%랑은 거리가 한참 멀다. 다음 주는 이걸 줄이는 게 일이다.</p>
+</body></html>
