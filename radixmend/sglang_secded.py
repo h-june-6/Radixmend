@@ -179,8 +179,12 @@ def _encode_scatter_kernel(buf_ptr, cw_ptr, loc_ptr, elab_ptr, bmask_ptr, stride
 @triton.jit
 def _check_fix_inplace_kernel(buf_ptr, cw_ptr, loc_ptr, indptr_ptr, nb, elab_ptr, bmask_ptr, inv_e_ptr,
                               inv_b_ptr, err_ptr, cwerr_ptr, stride_s, stride_h, H, log_ptr, logn_ptr, LOGCAP,
-                              tag, D: tl.constexpr, E: tl.constexpr, B: tl.constexpr):
-    """Check buf[loc[n], h] for n < indptr[nb]; fix single data-bit errors in place."""
+                              tag, D: tl.constexpr, E: tl.constexpr, B: tl.constexpr, REP: tl.constexpr = False,
+                              rep_map=None, rep_buf=None, rep_cw=None, rest_ptr=None):
+    """Check buf[loc[n], h] for n < indptr[nb]; fix single data-bit errors in place.
+
+    REP (module D): an uncorrectable vector whose slot has a replica is overwritten
+    in place with the replica (data and checkword) and not logged for module C."""
     n = tl.program_id(0)
     h = tl.program_id(1)
     total = tl.load(indptr_ptr + nb)
@@ -199,7 +203,15 @@ def _check_fix_inplace_kernel(buf_ptr, cw_ptr, loc_ptr, indptr_ptr, nb, elab_ptr
             tl.atomic_add(err_ptr + 0, 1)
         if st == 3:
             tl.atomic_add(err_ptr + 1, 1)
-            _log_bad(log_ptr, logn_ptr, LOGCAP, slot, h, tag, st == 3)
+            unrep = st == 3
+            if REP:
+                rs = tl.load(rep_map + slot).to(tl.int64)
+                if rs >= 0:
+                    tl.store(ptr + d, tl.load(rep_buf + rs * stride_s + h * stride_h + d))
+                    tl.store(cw_ptr + slot * H + h, tl.load(rep_cw + rs * H + h))
+                    tl.atomic_add(rest_ptr, 1)
+                    unrep = st < 0
+            _log_bad(log_ptr, logn_ptr, LOGCAP, slot, h, tag, unrep)
         if st == 2:
             # data is clean, the stored checkword took the hit: rewrite it
             q1 = _par16(se1) ^ _par16(sb1)
@@ -220,7 +232,8 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
            logit_cap: tl.constexpr, E: tl.constexpr, B: tl.constexpr, TM: tl.constexpr,
            POPC: tl.constexpr, SAMPLE: tl.constexpr, WB: tl.constexpr = False, count_ptr=None,
            DEDUP: tl.constexpr = False, SIGRED: tl.constexpr = False, log_ptr=None, logn_ptr=None,
-           LOGCAP=0, layer=0):
+           LOGCAP=0, layer=0, REP: tl.constexpr = False, rep_map=None, RK=None, RV=None, RKC=None, RVC=None,
+           rest_ptr=None):
     """Attention over one KV split. WB: write corrected words back to the KV buffer. TM: 0 no check, 1 full, 2 gate, 3 signature (no correction).
 
     TM 3 only accumulates, element-wise, the XOR of every K and V word and of the
@@ -294,7 +307,22 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
                     nk_fix += a
                     nk_bad += b_
                     if b_ > 0:
-                        _log_bad(log_ptr, logn_ptr, LOGCAP, kv_loc, cur_kv_head, layer * 4, mask_n & (cwk_new == -2))
+                        bad_k = mask_n & (cwk_new == -2)
+                        if REP:
+                            # module D: take uncorrectable vectors from the replica (same layout as the pool)
+                            rs = tl.load(rep_map + kv_loc, mask=bad_k, other=-1)
+                            use = bad_k & (rs >= 0)
+                            rs = tl.where(use, rs, 0).to(tl.int64)
+                            kr = tl.load(RK + rs[None, :] * stride_buf_kbs + base_offs_k,
+                                         mask=use[None, :] & mask_d[:, None], other=0.0)
+                            k = tl.where(use[None, :], kr, k)
+                            if WB:
+                                tl.store(K_Buffer + offs_buf_k, k, mask=use[None, :] & mask_d[:, None])
+                                tl.store(K_CW + kv_loc * H_KV + cur_kv_head,
+                                         tl.load(RKC + rs * H_KV + cur_kv_head, mask=use, other=0), mask=use)
+                            tl.atomic_add(rest_ptr, tl.sum(use.to(tl.int32), 0))
+                            bad_k = bad_k & (use == 0)
+                        _log_bad(log_ptr, logn_ptr, LOGCAP, kv_loc, cur_kv_head, layer * 4, bad_k)
                 if c_ > 0:
                     n_cw += c_
                     if WB:
@@ -331,7 +359,21 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
                     nv_fix += a
                     nv_bad += b_
                     if b_ > 0:
-                        _log_bad(log_ptr, logn_ptr, LOGCAP, kv_loc, cur_kv_head, layer * 4 + 2, mask_n & (cwv_new == -2))
+                        bad_v = mask_n & (cwv_new == -2)
+                        if REP:
+                            rs = tl.load(rep_map + kv_loc, mask=bad_v, other=-1)
+                            use = bad_v & (rs >= 0)
+                            rs = tl.where(use, rs, 0).to(tl.int64)
+                            vr = tl.load(RV + rs[:, None] * stride_buf_vbs + base_offs_v,
+                                         mask=use[:, None] & mask_dv[None, :], other=0.0)
+                            v = tl.where(use[:, None], vr, v)
+                            if WB:
+                                tl.store(V_Buffer + offs_buf_v, v, mask=use[:, None] & mask_dv[None, :])
+                                tl.store(V_CW + kv_loc * H_KV + cur_kv_head,
+                                         tl.load(RVC + rs * H_KV + cur_kv_head, mask=use, other=0), mask=use)
+                            tl.atomic_add(rest_ptr, tl.sum(use.to(tl.int32), 0))
+                            bad_v = bad_v & (use == 0)
+                        _log_bad(log_ptr, logn_ptr, LOGCAP, kv_loc, cur_kv_head, layer * 4 + 2, bad_v)
                 if c_ > 0:
                     n_cw += c_
                     if WB:
@@ -373,6 +415,7 @@ def _fwd_grouped_kernel_stage1_secded(
     SAMPLE: tl.constexpr = 1, phase_ptr=None, SIG: tl.constexpr = False, WB: tl.constexpr = False,
     count_ptr=None, DEDUP: tl.constexpr = False, bad_ptr=None, REDO: tl.constexpr = False,
     SIGRED: tl.constexpr = False, log_ptr=None, logn_ptr=None, LOGCAP=0, layer=0,
+    REP: tl.constexpr = False, rep_map=None, RK=None, RV=None, RKC=None, RVC=None,
 ):
     """SIG keeps only the cheap signature in this kernel and writes a per-program
     mismatch flag to bad_ptr; a second launch with REDO=True recomputes just the
@@ -423,7 +466,8 @@ def _fwd_grouped_kernel_stage1_secded(
             split_kv_end, cur_kv_head, H_KV, sm_scale_withk, mask_h, offs_d, offs_dv, mask_d, mask_dv,
             stride_buf_kbs, stride_buf_kh, stride_buf_vbs, stride_buf_vh, elab_ptr, bmask_ptr, inv_e_ptr,
             inv_b_ptr, phase_ptr, BLOCK_N, BLOCK_H, BLOCK_DMODEL, BLOCK_DV, logit_cap, E, B, TM, POPC, SAMPLE, WB, count_ptr, DEDUP, SIGRED,
-            log_ptr, logn_ptr, LOGCAP, layer)
+            log_ptr, logn_ptr, LOGCAP, layer, REP, rep_map, RK, RV, RKC, RVC,
+            err_ptr + 10)
         if SIG and not REDO:
             # mismatch somewhere in this split: the REDO launch recomputes it with the full
             # per-vector check and correction, overwriting this program's outputs
@@ -510,7 +554,8 @@ def _tables(device):
             inv_e=torch.tensor(inv_e, device=device),
             inv_b=torch.tensor(inv_b, device=device),
         )
-        _state["err"] = torch.zeros(10, dtype=torch.int32, device=device)  # [8] sig redo, [9] checkword errors
+        # [8] sig redo, [9] checkword errors, [10] decode / [11] extend vectors restored from a replica
+        _state["err"] = torch.zeros(12, dtype=torch.int32, device=device)
         _state["phase"] = torch.zeros(1, dtype=torch.int32, device=device)
         _state["log"] = torch.zeros(LOG_CAP * 3, dtype=torch.int32, device=device)
         _state["logn"] = torch.zeros(1, dtype=torch.int32, device=device)
@@ -603,10 +648,21 @@ def _launch_stage1_grid(grid, q, k_buffer, v_buffer, k_cw, v_cw, att_out, att_ls
         bad_ptr=bad, REDO=redo, SIGRED=bool(sigred and mode == "sig"),
         log_ptr=_state["log"], logn_ptr=_state["logn"], LOGCAP=LOG_CAP, layer=layer,
         phase_ptr=_state["phase"], num_warps=c["num_warps"], num_stages=c["num_stages"],
+        **_rep_args(k_buffer, v_buffer, layer, check and (redo or mode != "sig")),
     )
     # registers / spills of the compiled kernel (GPU only), for the RQ3 bench
     _state.setdefault("kinfo", {})[("redo" if redo else mode, bool(wb), bool(dedup), bool(sigred))] = (
         getattr(h, "n_regs", None), getattr(h, "n_spills", None))
+
+
+def _rep_args(k_buffer, v_buffer, layer: int, on: bool) -> dict:
+    """Kernel arguments of the module D replica of ``layer`` (REP off when there is none)."""
+    rep = _state.get("rep")
+    if not on or rep is None or layer not in rep["layers"]:
+        return {"REP": False}
+    rk, rv, rkc, rvc = rep["layers"][layer]
+    assert rk.stride() == k_buffer.stride() and rv.stride() == v_buffer.stride(), "replica layout must match the pool"
+    return {"REP": True, "rep_map": rep["map"], "RK": rk, "RV": rv, "RKC": rkc, "RVC": rvc}
 
 
 _NPROG = 512
@@ -634,8 +690,10 @@ def shared_prepass(k_buffer, v_buffer, k_cw, v_cw, kv_indices, kv_indptr, layer:
         )
 
 
-def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int, tag: int = 1) -> None:
-    """Check the prefix slots kv_indices[:kv_indptr[-1]] of one layer buffer, fix in place."""
+def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int, tag: int = 1, rep_buf=None,
+                      rep_cw=None) -> None:
+    """Check the prefix slots kv_indices[:kv_indptr[-1]] of one layer buffer, fix in place
+    (with ``rep_buf``/``rep_cw``: restore uncorrectable vectors that have a module D replica)."""
     t = _tables(buf.device)
     code = _state["code"]
     n = kv_indices.numel()
@@ -645,6 +703,8 @@ def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int, tag: int = 1
         buf, cw, kv_indices, kv_indptr, kv_indptr.numel() - 1, t["elab"], t["bmask"], t["inv_e"],
         t["inv_b"], _state["err"][err_off:], _state["err"][9:], buf.stride(0), buf.stride(1), buf.shape[1],
         _state["log"], _state["logn"], LOG_CAP, tag, D=buf.shape[2], E=code.e_bits, B=code.b_bits,
+        **({"REP": True, "rep_map": _state["rep"]["map"], "rep_buf": rep_buf, "rep_cw": rep_cw,
+            "rest_ptr": _state["err"][11:]} if rep_buf is not None else {}),
     )
 
 
@@ -654,8 +714,11 @@ def check_prefix(k_buffer, v_buffer, kv_indices, kv_indptr) -> bool:
     if cws is None or k_buffer.dim() != 3:
         return False
     lid = cws[2]
-    check_fix_inplace(k_buffer, cws[0], kv_indices, kv_indptr, 4, lid * 4 + 1)  # always the full check
-    check_fix_inplace(v_buffer, cws[1], kv_indices, kv_indptr, 6, lid * 4 + 3)
+    rep = _state.get("rep")
+    r = rep["layers"].get(lid) if rep is not None else None
+    check_fix_inplace(k_buffer, cws[0], kv_indices, kv_indptr, 4, lid * 4 + 1,  # always the full check
+                      *((r[0], r[2]) if r else ()))
+    check_fix_inplace(v_buffer, cws[1], kv_indices, kv_indptr, 6, lid * 4 + 3, *((r[1], r[3]) if r else ()))
     return True
 
 

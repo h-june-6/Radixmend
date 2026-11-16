@@ -11,7 +11,9 @@ how many tokens it wrote back).
 Run against a server in deterministic mode (outputs must not depend on batching)
 with ``--disable-overlap-schedule``:
 - module A + C: RADIXMEND_SECDED=1 RADIXMEND_RECOVER=1 -> blast radius = recomputed requests;
-- module A only: RADIXMEND_SECDED=1 -> blast radius = requests whose output changed.
+- module A only: RADIXMEND_SECDED=1 -> blast radius = requests whose output changed;
+- module A + C + D: also RADIXMEND_REPLICA=1 and --warm-twice -> errors in the shared
+  prefix are repaired from the replica (replica_stats restored_*), nothing is recomputed.
 
     python scripts/rq4_blast.py --out results/rq4/c_n8 --n 8 --when decode --reps 20
     python scripts/rq4_blast.py --out results/rq4/c_n8_fake --n 8 --when decode --kinds fake --reps 5
@@ -34,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rq1_derived as dv  # noqa: E402
 import rq1_kv_sweep as kv  # noqa: E402
 
-STAT_OPS = ("secded_stats", "recover_stats")
+STAT_OPS = ("secded_stats", "recover_stats", "replica_stats")
 
 
 def build(tok, n: int):
@@ -73,6 +75,9 @@ def burst(url: str, prompts, max_new: int):
 def trial(a, cmd_dir: Path, warm, prompts, shared, inject):
     kv.flush(a.url)
     kv.generate(a.url, warm, a.warm_new)
+    if a.warm_twice:
+        # a second request reusing the warm prompt: module D replicates the prefix on that hit
+        kv.generate(a.url, warm, a.warm_new)
     for op in STAT_OPS:
         kv.hook(cmd_dir, {"op": op, "reset": True})
     op = {"op": "inject_kv", **inject, "pos_lo": 0, "pos_hi": shared}
@@ -101,7 +106,7 @@ def summarize(tpath: Path) -> None:
     gold = [r for r in rows if r.get("golden")]
     rs = [r for r in rows if not r.get("golden") and not r.get("error")]
     print("kind,bits,n,trials,not_triggered,detected,reqs_changed(mean/max),reqs_retracted(mean/max),"
-          "tokens_repaired(mean),wall_s(median),golden_wall_s(median),req_s(median),golden_req_s(median)")
+          "tokens_repaired(mean),replica_restored(mean),wall_s(median),golden_wall_s(median),req_s(median),golden_req_s(median)")
     gw = statistics.median(g["wall"] for g in gold) if gold else float("nan")
     gq = statistics.median(s for g in gold for s in g["secs"]) if gold else float("nan")
     for key in sorted({(r["kind"], r["bits"], r["n"]) for r in rs}):
@@ -109,11 +114,13 @@ def summarize(tpath: Path) -> None:
         ch = [r["n_changed"] for r in g]
         rt = [r["stats"]["recover_stats"].get("reqs_retracted", 0) for r in g]
         tr = [r["stats"]["recover_stats"].get("tokens_repaired", 0) for r in g]
+        rr = [r["stats"].get("replica_stats", {}).get("restored_decode", 0)
+              + r["stats"].get("replica_stats", {}).get("restored_extend", 0) for r in g]
         det = sum(1 for r in g if any(r["stats"]["secded_stats"].get(f"{p}_{k}_uncorrectable", 0)
                                       for p in ("decode", "extend") for k in ("k", "v")))
         print(f"{key[0]},{key[1]},{key[2]},{len(g)},{sum(1 for r in g if r['inject'].get('not_triggered'))},"
               f"{det},{statistics.mean(ch):.2f}/{max(ch)},{statistics.mean(rt):.2f}/{max(rt)},"
-              f"{statistics.mean(tr):.0f},{statistics.median(r['wall'] for r in g):.3f},{gw:.3f},"
+              f"{statistics.mean(tr):.0f},{statistics.mean(rr):.1f},{statistics.median(r['wall'] for r in g):.3f},{gw:.3f},"
               f"{statistics.median(s for r in g for s in r['secs']):.3f},{gq:.3f}")
 
 
@@ -132,6 +139,8 @@ def main() -> None:
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--when", choices=["hit", "decode"], default="decode")
     ap.add_argument("--after-tokens", type=int, default=4)
+    ap.add_argument("--warm-twice", action="store_true",
+                    help="send the warm prompt twice (module D makes its replica on the first reuse)")
     ap.add_argument("--summarize", action="store_true")
     a = ap.parse_args()
     out = Path(a.out)
