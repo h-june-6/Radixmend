@@ -1,0 +1,319 @@
+"""Module B (first cut): SECDED on slot indices inside SGLang v0.5.22.
+
+Code: extended Hamming over the 32 low bits of a slot index (6 check bits +
+overall parity = 7 bits), the same code as ``radixmend.secded_index`` with
+``data_bits=32``. Two structures are covered here, the two RQ1-5 found most
+harmful (silent output changes from low-bit flips):
+
+* radix tree ``node.value`` (int64): the code sits in the unused high bits of each
+  word, bits 32..38, with a marker at bit 39 so encoded and plain indices can be
+  told apart (a flip of the marker only makes the word read as plain). Words are
+  encoded on ``insert``; every read of a node path (``collect_full_device_indices``,
+  i.e. load-back / prefix / repoint) and of ``match_prefix`` checks and corrects the nodes in place and returns
+  plain indices, and ``allocator.free`` checks and strips encoded words (eviction
+  and duplicate frees). Codes are per element, so node splits keep them.
+* ``req_to_token`` (int32): the word has no room, so the code is kept in a shadow
+  int8 table of the same shape (a quarter of its size). Every write re-encodes
+  what was written; the choke point is the kv_indices gather used by every
+  attention call (``KVIndexTranslator.pack_read_stream``): a second kernel re-reads
+  the same entries with their codes, corrects single-bit errors in ``kv_indices``
+  and in the table, and counts what it cannot correct.
+
+Not covered yet (week 12): ``free_pages`` (allocator free list), ``seq_lens``
+(compare with its CPU mirror), cross-recovery of uncorrectable entries.
+
+Enable with ``RADIXMEND_INDEX=1``. Install before modules C and D so their
+wrappers see plain indices.
+"""
+
+from __future__ import annotations
+
+import os
+
+import torch
+import triton
+import triton.language as tl
+
+from radixmend.secded_index import CORRECTED_CHECK, CORRECTED_DATA, DETECTED, IndexCode
+
+LOW = 0xFFFFFFFF
+SHIFT = 32
+MARK = 1 << 39
+R = 6  # Hamming check bits for 32 data bits
+
+_state = {"dev": None, "err": None, "r2t_pool": None}
+# err: [0] node corrected, [1] node uncorrectable, [2] req_to_token corrected,
+#      [3] req_to_token uncorrectable, [4] node / [5] req_to_token check-bit-only errors fixed
+
+
+def _tables(device):
+    if _state["dev"] != str(device):
+        code = IndexCode(data_bits=32, word_bits=64)
+        assert code.r == R
+        _state.update(
+            dev=str(device), code=code,
+            masks=torch.tensor(code.col_masks, dtype=torch.int64, device=device),
+            lut_s=torch.tensor(code.lut_status.astype("int32"), dtype=torch.int32, device=device),
+            lut_b=torch.tensor(code.lut_bit, dtype=torch.int64, device=device),
+            err=torch.zeros(6, dtype=torch.int32, device=device),
+        )
+    return _state
+
+
+def _par(x: torch.Tensor) -> torch.Tensor:
+    for s in (32, 16, 8, 4, 2, 1):
+        x = x ^ (x >> s)
+    return x & 1
+
+
+def code_of(d: torch.Tensor) -> torch.Tensor:
+    """7-bit code (6 Hamming bits, then the overall parity bit) of 32-bit data, int64."""
+    t = _tables(d.device)
+    d = d.to(torch.int64) & LOW
+    h = torch.zeros_like(d)
+    for k in range(R):
+        h |= _par(d & t["masks"][k]) << k
+    return h | ((_par(d) ^ _par(h)) << R)
+
+
+def check(d: torch.Tensor, c: torch.Tensor):
+    """(fixed data, fixed code, status) for 32-bit data ``d`` and 7-bit codes ``c`` (int64)."""
+    t = _tables(d.device)
+    d = d & LOW
+    c = c & 127
+    h = code_of(d) & 63
+    s = h ^ (c & 63)
+    odd = (_par(d) ^ _par(c)) == 1
+    st = torch.where(odd, t["lut_s"][s].to(torch.int64),
+                     torch.where(s != 0, torch.full_like(s, DETECTED), torch.zeros_like(s)))
+    bit = torch.where(odd, t["lut_b"][s], torch.full_like(s, -1))
+    fix_d = st == CORRECTED_DATA
+    one = torch.ones_like(d)
+    d2 = torch.where(fix_d, d ^ (one << bit.clamp(min=0)), d)
+    c2 = torch.where(fix_d | (st == CORRECTED_CHECK), code_of(d2), c)
+    return d2, c2, st
+
+
+# ---- node.value: code in the high bits --------------------------------------------------
+
+
+def encode_value(v: torch.Tensor) -> torch.Tensor:
+    """Encoded copy of an int64 slot-index tensor (plain or already encoded input)."""
+    d = v.to(torch.int64) & LOW
+    return d | (code_of(d) << SHIFT) | MARK
+
+
+def check_value_(v: torch.Tensor) -> torch.Tensor:
+    """Check and correct encoded words of ``v`` in place; returns plain indices (a new tensor)."""
+    if v is None or v.numel() == 0:
+        return v
+    t = _tables(v.device)
+    marked = (v & MARK) != 0
+    d2, c2, st = check(v & LOW, v >> SHIFT)
+    st = torch.where(marked, st, torch.zeros_like(st))
+    fixed = d2 | (c2 << SHIFT) | MARK
+    v.copy_(torch.where(marked, fixed, v))
+    t["err"][0] += (st == CORRECTED_DATA).sum().to(torch.int32)
+    t["err"][1] += (st == DETECTED).sum().to(torch.int32)
+    t["err"][4] += (st == CORRECTED_CHECK).sum().to(torch.int32)
+    return v & LOW
+
+
+def plain(v: torch.Tensor) -> torch.Tensor:
+    return v & LOW if v.dtype == torch.int64 else v
+
+
+# ---- req_to_token: shadow codes, checked at the kv_indices gather -------------------------
+
+
+def shadow_encode(vals: torch.Tensor) -> torch.Tensor:
+    return code_of(vals).to(torch.int8)
+
+
+@triton.jit
+def _par64(x):
+    x = x ^ (x >> 32)
+    x = x ^ (x >> 16)
+    x = x ^ (x >> 8)
+    x = x ^ (x >> 4)
+    x = x ^ (x >> 2)
+    x = x ^ (x >> 1)
+    return x & 1
+
+
+@triton.jit
+def _check_gather_kernel(r2t, shadow, rows, lens, indptr, kv_start_idx, out, stride, masks, lut_s, lut_b, err,
+                         HAS_START: tl.constexpr, R: tl.constexpr, BLOCK: tl.constexpr):
+    """Re-read the entries ``create_flashinfer_kv_indices_triton`` gathered, with their
+    shadow codes; fix single-bit errors in ``out`` and in the table."""
+    pid = tl.program_id(0)
+    row = tl.load(rows + pid).to(tl.int64)
+    base = tl.load(indptr + pid).to(tl.int64)
+    st0 = 0
+    if HAS_START:
+        st0 = tl.load(kv_start_idx + pid).to(tl.int64)
+    n = tl.load(lens + pid).to(tl.int64)
+    for b in range(0, tl.cdiv(n, BLOCK)):
+        j = b * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+        m = j < n
+        p = row * stride + st0 + j
+        d = tl.load(r2t + p, mask=m, other=0).to(tl.int64) & 0xFFFFFFFF
+        c = tl.load(shadow + p, mask=m, other=0).to(tl.int64) & 127
+        h = d * 0
+        for k in tl.static_range(R):
+            h = h | (_par64(d & tl.load(masks + k)) << k)
+        s = h ^ (c & 63)
+        odd = (_par64(d) ^ _par64(c)) == 1
+        status = tl.where(odd, tl.load(lut_s + s), tl.where(s != 0, 3, 0))
+        bit = tl.load(lut_b + s)
+        fix_d = m & odd & (status == 1)
+        one = d * 0 + 1
+        d2 = tl.where(fix_d, d ^ (one << tl.maximum(bit, 0)), d)
+        tl.store(out + base + j, d2.to(out.dtype.element_ty), mask=fix_d)
+        tl.store(r2t + p, d2.to(tl.int32), mask=fix_d)
+        h2 = d * 0
+        for k in tl.static_range(R):
+            h2 = h2 | (_par64(d2 & tl.load(masks + k)) << k)
+        c2 = h2 | ((_par64(d2) ^ _par64(h2)) << R)
+        fix_c = m & odd & ((status == 1) | (status == 2))
+        tl.store(shadow + p, c2.to(tl.int8), mask=fix_c)
+        nd = tl.sum(fix_d.to(tl.int32), 0)
+        nc = tl.sum((m & odd & (status == 2)).to(tl.int32), 0)
+        nb = tl.sum((m & (status == 3)).to(tl.int32), 0)
+        if nd > 0:
+            tl.atomic_add(err + 2, nd)
+        if nb > 0:
+            tl.atomic_add(err + 3, nb)
+        if nc > 0:
+            tl.atomic_add(err + 5, nc)
+
+
+def check_gather(r2t, shadow, rows, lens, indptr, kv_start_idx, out) -> None:
+    t = _tables(r2t.device)
+    bs = int(lens.numel())
+    if bs == 0:
+        return
+    _check_gather_kernel[(bs,)](
+        r2t, shadow, rows, lens, indptr, kv_start_idx, out, r2t.stride(0), t["masks"], t["lut_s"], t["lut_b"],
+        t["err"], HAS_START=kv_start_idx is not None, R=R, BLOCK=512,
+    )
+
+
+def stats(reset: bool = False) -> dict:
+    err = _state["err"]
+    vals = [int(x) for x in err.tolist()] if err is not None else [0] * 6
+    if reset and err is not None:
+        err.zero_()
+    names = ["node_corrected", "node_uncorrectable", "r2t_corrected", "r2t_uncorrectable",
+             "node_check_bits_fixed", "r2t_check_bits_fixed"]
+    return dict(zip(names, vals))
+
+
+def install() -> None:
+    if os.environ.get("RADIXMEND_INDEX") != "1":
+        return
+    from dataclasses import replace
+
+    from sglang.srt.mem_cache import allocation as al
+    from sglang.srt.mem_cache import kv_index_translator as kt
+    from sglang.srt.mem_cache import memory_pool as mp
+    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from sglang.srt.mem_cache.allocator import token as tok
+    from sglang.srt.mem_cache.unified_cache import unified_tree_core as utc
+    from sglang.srt.mem_cache.unified_cache.components.base import BASE_COMPONENT_TYPE
+
+    if getattr(urc.UnifiedRadixCache, "_rm_index", False):
+        return
+
+    # req_to_token: shadow codes
+    orig_r2t_init = mp.ReqToTokenPool.__init__
+
+    def r2t_init(self, *args, **kwargs):
+        orig_r2t_init(self, *args, **kwargs)
+        _tables(self.req_to_token.device)
+        self.rm_shadow = torch.zeros(self.req_to_token.shape, dtype=torch.int8, device=self.req_to_token.device)
+        _state["r2t_pool"] = self
+
+    orig_write = mp.ReqToTokenPool.write
+
+    def r2t_write(self, indices, values):
+        if isinstance(values, torch.Tensor) and values.dtype == torch.int64:
+            values = values & LOW
+        orig_write(self, indices, values)
+        sh = getattr(self, "rm_shadow", None)
+        if sh is not None:
+            sh[indices] = shadow_encode(self.req_to_token[indices])
+
+    orig_wci = al.write_cache_indices
+
+    def write_cache_indices(out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu, prefix_lens_tensor,
+                            prefix_lens_cpu, seq_lens_tensor, seq_lens_cpu, extend_lens_tensor, extend_lens_cpu,
+                            prefix_tensors, req_to_token_pool):
+        orig_wci(out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu, prefix_lens_tensor, prefix_lens_cpu,
+                 seq_lens_tensor, seq_lens_cpu, extend_lens_tensor, extend_lens_cpu, prefix_tensors,
+                 req_to_token_pool)
+        sh = getattr(req_to_token_pool, "rm_shadow", None)
+        if sh is not None and seq_lens_cpu.numel():
+            # every entry [0, seq_len) of these rows was just written (prefix + new tokens)
+            w = int(seq_lens_cpu.max())
+            rows = req_pool_indices_tensor.to(torch.int64)
+            sh[rows, :w] = shadow_encode(req_to_token_pool.req_to_token[rows, :w])
+
+    orig_pack = kt.KVIndexTranslator.pack_read_stream
+
+    def pack_read_stream(self, plan, *, req_pool_indices, seq_lens, indptr, out, kv_start_idx=None,
+                         kind=kt.IdSpaceKind.FULL, token_mapping=None):
+        res = orig_pack(self, plan, req_pool_indices=req_pool_indices, seq_lens=seq_lens, indptr=indptr, out=out,
+                        kv_start_idx=kv_start_idx, kind=kind, token_mapping=token_mapping)
+        pool = _state["r2t_pool"]
+        if (pool is not None and token_mapping is None and not self._reads_translated(kind)
+                and self.req_to_token is pool.req_to_token):
+            bs = int(seq_lens.numel())
+            check_gather(pool.req_to_token, pool.rm_shadow, req_pool_indices[:bs], seq_lens, indptr,
+                         kv_start_idx, out)
+        return res
+
+    # node.value: code in the high bits
+    orig_insert = urc.UnifiedRadixCache.insert
+
+    def insert(self, params):
+        if params.value is not None and params.value.dtype == torch.int64 and params.value.numel():
+            params = replace(params, value=encode_value(params.value))
+        return orig_insert(self, params)
+
+    orig_collect = utc.UnifiedTreeCore.collect_full_device_indices
+
+    def collect_full_device_indices(self, from_node_id, until_node_id):
+        until = self.node_by_id(until_node_id)
+        node = self.node_by_id(from_node_id)
+        while node is not None and node is not until:
+            v = node.component_data[BASE_COMPONENT_TYPE].value
+            if isinstance(v, torch.Tensor) and v.numel():
+                check_value_(v)
+            node = node.parent
+        return plain(orig_collect(self, from_node_id, until_node_id))
+
+    # match_prefix gathers node values itself (not through collect_full_device_indices)
+    orig_helper = utc.UnifiedTreeCore._match_prefix_helper
+
+    def _match_prefix_helper(self, key):
+        value, *rest = orig_helper(self, key)
+        value = [check_value_(v) if isinstance(v, torch.Tensor) and v.dtype == torch.int64 else v for v in value]
+        return (value, *rest)
+
+    orig_free = tok.TokenToKVPoolAllocator.free
+
+    def free(self, free_index):
+        if isinstance(free_index, torch.Tensor) and free_index.dtype == torch.int64 and free_index.numel():
+            free_index = check_value_(free_index.clone())
+        return orig_free(self, free_index)
+
+    mp.ReqToTokenPool.__init__ = r2t_init
+    mp.ReqToTokenPool.write = r2t_write
+    al.write_cache_indices = write_cache_indices
+    kt.KVIndexTranslator.pack_read_stream = pack_read_stream
+    urc.UnifiedRadixCache.insert = insert
+    utc.UnifiedTreeCore.collect_full_device_indices = collect_full_device_indices
+    utc.UnifiedTreeCore._match_prefix_helper = _match_prefix_helper
+    tok.TokenToKVPoolAllocator.free = free
+    urc.UnifiedRadixCache._rm_index = True

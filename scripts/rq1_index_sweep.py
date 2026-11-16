@@ -128,6 +128,10 @@ def summarize(out: Path) -> None:
             o = (r.get("inject") or {}).get("new_owner")
             if o:
                 owners[o] = owners.get(o, 0) + 1
+        for r in rs:
+            for k, v in (r.get("index_stats") or {}).items():
+                if isinstance(v, int) and not isinstance(v, bool):
+                    owners[f"B:{k}"] = owners.get(f"B:{k}", 0) + v
         lines.append(f"{t},{g},{len(rs)}," + ",".join(str(cnt[c]) for c in cols) + "," +
                      ";".join(f"{k}={v}" for k, v in sorted(owners.items())))
     (out / "summary.csv").write_text("\n".join(lines) + "\n")
@@ -149,6 +153,7 @@ def main() -> None:
     ap.add_argument("--after-tokens", type=int, default=8)
     ap.add_argument("--req-timeout", type=float, default=120)
     ap.add_argument("--summarize", action="store_true")
+    ap.add_argument("--index-stats", action="store_true", help="record module B counters per trial (RADIXMEND_INDEX=1)")
     a = ap.parse_args()
     out = Path(a.out)
     if a.summarize:
@@ -203,6 +208,11 @@ def main() -> None:
             rec.update(first_diff=diffs, n_changed=sum(d is not None for d in diffs))
             outcome = "changed" if rec["n_changed"] else "unchanged"
         rec.update(outcome=outcome, inject=inj, error=err, seconds=round(time.monotonic() - t0, 2))
+        if a.index_stats and alive:
+            try:
+                rec["index_stats"] = kv.hook(cmd_dir, {"op": "index_stats", "reset": True})
+            except Exception as e:
+                rec["index_stats"] = {"error": repr(e)}
         # replace the provisional line
         lines = [l for l in tpath.read_text().splitlines() if l.strip()]
         lines[-1] = json.dumps(rec)

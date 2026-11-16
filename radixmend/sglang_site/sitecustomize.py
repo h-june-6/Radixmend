@@ -5,7 +5,7 @@ Installs the RadixMend fault-injection hook in every SGLang process
 module A prototype (SECDED check inside triton decode attention) when
 RADIXMEND_SECDED=1, module C recovery (retract + recompute on uncorrectable
 errors) when RADIXMEND_RECOVER=1 as well, module D replicas of shared prefixes when
-RADIXMEND_REPLICA=1, and the hit-time hash baseline when
+RADIXMEND_REPLICA=1, module B index protection when RADIXMEND_INDEX=1, and the hit-time hash baseline when
 RADIXMEND_HASH=1.
 Does nothing otherwise.
 """
@@ -19,6 +19,14 @@ if os.environ.get("RADIXMEND_CMD_DIR"):
         install()
     except Exception as e:  # never block interpreter start-up
         print(f"[radixmend] hook not installed: {e!r}", file=sys.stderr)
+
+if os.environ.get("RADIXMEND_INDEX") == "1":  # module B, before C and D so they see plain indices
+    try:
+        from radixmend.sglang_index import install as index_install
+
+        index_install()
+    except Exception as e:
+        print(f"[radixmend] index protection not installed: {e!r}", file=sys.stderr)
 
 if os.environ.get("RADIXMEND_SECDED") == "1":
     try:

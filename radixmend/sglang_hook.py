@@ -232,7 +232,7 @@ def _op_inject_index(sched, cmd):
         pos = pick(int(cmd.get("pos_lo", 0)), min(int(cmd.get("pos_hi", len(val))), len(val)))
         old, new = _flip_one(val, pos, bit)
         return {"target": target, "position": pos, "bit": bit, "old": old, "new": new,
-                "new_owner": _slot_owner(sched, new, node)}
+                "new_owner": _slot_owner(sched, new & 0xFFFFFFFF, node)}
     if target == "free_pages":
         fp = sched.token_to_kv_pool_allocator.free_pages
         idx = pick(0, min(int(cmd.get("head", 64)), len(fp)))
@@ -364,6 +364,12 @@ def _op_replica_stats(sched, cmd):
     return {"enabled": sd.rep() is not None, **sd.stats(reset=bool(cmd.get("reset")))}
 
 
+def _op_index_stats(sched, cmd):
+    from radixmend import sglang_index as sb
+
+    return {"enabled": sb._state["err"] is not None, **sb.stats(reset=bool(cmd.get("reset")))}
+
+
 def _op_hash_stats(sched, cmd):
     from radixmend import sglang_hash as sh
 
@@ -375,7 +381,7 @@ _OPS = {"tree_info": _op_tree_info, "inject_kv": _op_inject_kv, "revert": _op_re
         "snapshot_kv": _op_snapshot_kv, "compare_kv": _op_compare_kv,
         "secded_stats": _op_secded_stats, "secded_log": _op_secded_log,
         "hash_stats": _op_hash_stats, "recover_stats": _op_recover_stats,
-        "replica_stats": _op_replica_stats}
+        "replica_stats": _op_replica_stats, "index_stats": _op_index_stats}
 
 
 def poll(sched, cmd_dir: Path) -> None:

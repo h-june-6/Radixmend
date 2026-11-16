@@ -228,7 +228,8 @@ def sink_slots(root, n_tokens: int = 4) -> list[int]:
 
 
 def node_slots(node) -> list[int]:
-    return [int(s) for s in node_value(node).tolist()]
+    # low 32 bits: module B keeps its code in the high bits of node.value
+    return [int(s) & 0xFFFFFFFF for s in node_value(node).tolist()]
 
 
 def nodes_by_sharing(root, top: int | None = None) -> list[tuple[object, int, int, int]]:
