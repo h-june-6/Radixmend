@@ -23,7 +23,8 @@ harmful (silent output changes from low-bit flips):
   ``node.value``; ``free`` encodes what it returns to the list, ``alloc`` checks and strips
   what it hands out, so a flip in the free list cannot hand out a slot another node owns.
 * ``seq_lens`` (int64, GPU): the scheduler keeps an exact CPU mirror (``seq_lens_cpu``);
-  after ``prepare_for_decode`` / ``prepare_for_extend`` the GPU copy is replaced by the mirror and mismatches are counted.
+  after ``prepare_for_decode`` / ``prepare_for_extend`` and before ``ForwardBatch.init_new``
+  the GPU copy is replaced by the mirror, and the forward never shares its tensor with the scheduler, and mismatches are counted.
 
 Not covered yet: cross-recovery of uncorrectable entries (node.value <-> req_to_token).
 
@@ -479,11 +480,13 @@ def install() -> None:
     orig_pfe = sbm.ScheduleBatch.prepare_for_extend
 
     def prepare_for_decode(self, *args, **kwargs):
+        _restore_seq_lens(self)  # the prep itself reads seq_lens (slot allocation, req_to_token writes)
         res = orig_pfd(self, *args, **kwargs)
         _restore_seq_lens(self)
         return res
 
     def prepare_for_extend(self, *args, **kwargs):
+        _restore_seq_lens(self)  # the prep itself reads seq_lens (slot allocation, req_to_token writes)
         res = orig_pfe(self, *args, **kwargs)
         _restore_seq_lens(self)
         return res
@@ -499,6 +502,25 @@ def install() -> None:
     tok.TokenToKVPoolAllocator.clear = clear
     tok.TokenToKVPoolAllocator.alloc = alloc
     tok.TokenToKVPoolAllocator.get_all_free_pages = get_all_free_pages
+    # The forward must not share its seq_lens tensor with the scheduler: with overlap scheduling the
+    # scheduler's tensor can change (or be hit) while the forward that was handed it is still queued.
+    # Build the forward from a private copy of the CPU mirror, then give the scheduler another one.
+    from sglang.srt.model_executor import forward_batch_info as fbi
+
+    orig_fb_init = fbi.ForwardBatch.init_new
+
+    def fb_init_new(cls, batch, *args, **kwargs):
+        gl, cl = getattr(batch, "seq_lens", None), getattr(batch, "seq_lens_cpu", None)
+        ok = (isinstance(gl, torch.Tensor) and isinstance(cl, torch.Tensor) and gl.numel()
+              and gl.shape == cl.shape and gl.dtype == cl.dtype)
+        if ok:
+            _restore_seq_lens(batch)
+        fb = orig_fb_init(batch, *args, **kwargs)
+        if ok:
+            batch.seq_lens = cl.to(gl.device, non_blocking=True)  # the scheduler's own copy
+        return fb
+
+    fbi.ForwardBatch.init_new = classmethod(fb_init_new)
     sbm.ScheduleBatch.prepare_for_decode = prepare_for_decode
     sbm.ScheduleBatch.prepare_for_extend = prepare_for_extend
     urc.UnifiedRadixCache._rm_index = True

@@ -156,6 +156,7 @@ def test_install_targets_exist_in_sglang():
                                                  for a in ("free", "clear", "alloc", "get_all_free_pages")],
         "sglang.srt.managers.schedule_batch": [("ScheduleBatch", "prepare_for_decode"),
                                                ("ScheduleBatch", "prepare_for_extend")],
+        "sglang.srt.model_executor.forward_batch_info": [("ForwardBatch", "init_new")],
     }
     missing = []
     for mod, attrs in targets.items():
