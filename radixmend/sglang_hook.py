@@ -232,13 +232,13 @@ def _op_inject_index(sched, cmd):
         pos = pick(int(cmd.get("pos_lo", 0)), min(int(cmd.get("pos_hi", len(val))), len(val)))
         old, new = _flip_one(val, pos, bit)
         return {"target": target, "position": pos, "bit": bit, "old": old, "new": new,
-                "new_owner": _slot_owner(sched, new & 0xFFFFFFFF, node)}
+                "new_owner": _slot_owner(sched, _plain_slot(new), node)}
     if target == "free_pages":
         fp = sched.token_to_kv_pool_allocator.free_pages
         idx = pick(0, min(int(cmd.get("head", 64)), len(fp)))
         old, new = _flip_one(fp, idx, bit)
         return {"target": target, "index": idx, "bit": bit, "old": old, "new": new,
-                "new_owner": _slot_owner(sched, new, None)}
+                "new_owner": _slot_owner(sched, _plain_slot(new), None)}
     # deferred targets: wait for a running request with enough output
     batch = sched.running_batch
     reqs = [r for r in (batch.reqs if batch is not None else []) if len(r.output_ids) >= int(cmd.get("after_tokens", 1))]
@@ -362,6 +362,11 @@ def _op_replica_stats(sched, cmd):
     from radixmend import sglang_replica as sd
 
     return {"enabled": sd.rep() is not None, **sd.stats(reset=bool(cmd.get("reset")))}
+
+
+def _plain_slot(x: int) -> int:
+    """Slot number of an index word: module B words carry a marker at bit 39 and the code above bit 31."""
+    return x & 0xFFFFFFFF if (x >> 39) & 1 else x
 
 
 def _op_index_stats(sched, cmd):

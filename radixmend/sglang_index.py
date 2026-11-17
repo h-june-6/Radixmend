@@ -19,8 +19,13 @@ harmful (silent output changes from low-bit flips):
   the same entries with their codes, corrects single-bit errors in ``kv_indices``
   and in the table, and counts what it cannot correct.
 
-Not covered yet (week 12): ``free_pages`` (allocator free list), ``seq_lens``
-(compare with its CPU mirror), cross-recovery of uncorrectable entries.
+* the allocator free list ``free_pages`` / ``release_pages`` (int64): same encoding as
+  ``node.value``; ``free`` encodes what it returns to the list, ``alloc`` checks and strips
+  what it hands out, so a flip in the free list cannot hand out a slot another node owns.
+* ``seq_lens`` (int64, GPU): the scheduler keeps an exact CPU mirror (``seq_lens_cpu``);
+  before each forward the GPU copy is replaced by the mirror and mismatches are counted.
+
+Not covered yet: cross-recovery of uncorrectable entries (node.value <-> req_to_token).
 
 Enable with ``RADIXMEND_INDEX=1``. Install before modules C and D so their
 wrappers see plain indices.
@@ -42,8 +47,9 @@ MARK = 1 << 39
 R = 6  # Hamming check bits for 32 data bits
 
 _state = {"dev": None, "err": None, "r2t_pool": None, "step": 0, "seen": {}}
-# err: [0] node corrected, [1] node uncorrectable, [2] req_to_token corrected,
-#      [3] req_to_token uncorrectable, [4] node / [5] req_to_token check-bit-only errors fixed
+# err: [0] node / free-list corrected, [1] node / free-list uncorrectable, [2] req_to_token corrected,
+#      [3] req_to_token uncorrectable, [4] node / [5] req_to_token check-bit-only errors fixed,
+#      [6] seq_lens entries restored from the CPU mirror
 
 
 def _tables(device):
@@ -55,7 +61,7 @@ def _tables(device):
             masks=torch.tensor(code.col_masks, dtype=torch.int64, device=device),
             lut_s=torch.tensor(code.lut_status.astype("int32"), dtype=torch.int32, device=device),
             lut_b=torch.tensor(code.lut_bit, dtype=torch.int64, device=device),
-            err=torch.zeros(6, dtype=torch.int32, device=device),
+            err=torch.zeros(7, dtype=torch.int32, device=device),
         )
     return _state
 
@@ -330,11 +336,11 @@ def check_gather(r2t, shadow, rows, lens, indptr, kv_start_idx, out) -> None:
 
 def stats(reset: bool = False) -> dict:
     err = _state["err"]
-    vals = [int(x) for x in err.tolist()] if err is not None else [0] * 6
+    vals = [int(x) for x in err.tolist()] if err is not None else [0] * 7
     if reset and err is not None:
         err.zero_()
     names = ["node_corrected", "node_uncorrectable", "r2t_corrected", "r2t_uncorrectable",
-             "node_check_bits_fixed", "r2t_check_bits_fixed"]
+             "node_check_bits_fixed", "r2t_check_bits_fixed", "seq_lens_restored"]
     return dict(zip(names, vals))
 
 
@@ -435,8 +441,42 @@ def install() -> None:
 
     def free(self, free_index):
         if isinstance(free_index, torch.Tensor) and free_index.dtype == torch.int64 and free_index.numel():
-            free_index = check_value_(free_index.clone())
+            free_index = encode_value(check_value_(free_index.clone()))
         return orig_free(self, free_index)
+
+    orig_clear = tok.TokenToKVPoolAllocator.clear
+
+    def clear(self):
+        orig_clear(self)
+        self.free_pages = encode_value(self.free_pages)
+
+    orig_alloc = tok.TokenToKVPoolAllocator.alloc
+
+    def alloc(self, need_size):
+        sel = orig_alloc(self, need_size)
+        if isinstance(sel, torch.Tensor) and sel.numel():
+            sel = check_value_(sel.clone())
+        return sel
+
+    orig_all_free = tok.TokenToKVPoolAllocator.get_all_free_pages
+
+    def get_all_free_pages(self):
+        fp = orig_all_free(self)
+        return plain(fp) if isinstance(fp, torch.Tensor) else fp
+
+    from sglang.srt.managers import schedule_batch as sbm
+
+    orig_mwb = sbm.ScheduleBatch.get_model_worker_batch
+
+    def get_model_worker_batch(self, *args, **kwargs):
+        gl, cl = getattr(self, "seq_lens", None), getattr(self, "seq_lens_cpu", None)
+        if (isinstance(gl, torch.Tensor) and isinstance(cl, torch.Tensor) and gl.numel()
+                and gl.shape == cl.shape and gl.dtype == cl.dtype):
+            fresh = cl.to(gl.device, non_blocking=True)
+            t = _tables(gl.device)
+            t["err"][6] += (gl != fresh).sum().to(torch.int32)
+            self.seq_lens = fresh  # new tensor, like prepare_for_decode does
+        return orig_mwb(self, *args, **kwargs)
 
     mp.ReqToTokenPool.__init__ = r2t_init
     mp.ReqToTokenPool.write = r2t_write
@@ -446,4 +486,8 @@ def install() -> None:
     utc.UnifiedTreeCore.collect_full_device_indices = collect_full_device_indices
     utc.UnifiedTreeCore._match_prefix_helper = _match_prefix_helper
     tok.TokenToKVPoolAllocator.free = free
+    tok.TokenToKVPoolAllocator.clear = clear
+    tok.TokenToKVPoolAllocator.alloc = alloc
+    tok.TokenToKVPoolAllocator.get_all_free_pages = get_all_free_pages
+    sbm.ScheduleBatch.get_model_worker_batch = get_model_worker_batch
     urc.UnifiedRadixCache._rm_index = True
