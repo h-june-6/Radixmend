@@ -105,3 +105,24 @@ def test_check_gather_fixes_out_and_table():
     assert torch.equal(shadow[1], sb.shadow_encode(clean[1]))
     st = sb.stats(reset=True)
     assert st["r2t_corrected"] == 1 and st["r2t_check_bits_fixed"] == 1 and st["r2t_uncorrectable"] == 1
+
+
+def test_kernels_match_reference_paths():
+    """Under TRITON_INTERPRET=1 the public functions run the fused kernels; compare with the torch refs."""
+    _reset()
+    gen = torch.Generator().manual_seed(7)
+    v = torch.randint(1, 2**31 - 1, (3000,), dtype=torch.int64, generator=gen)
+    assert torch.equal(sb.encode_value(v), sb._encode_value_ref(v))
+    assert torch.equal(sb.shadow_encode(v.to(torch.int32)), sb._shadow_encode_ref(v.to(torch.int32)))
+    e = sb.encode_value(v)
+    flips = torch.randint(0, 39, (3000,), generator=gen)
+    two = torch.rand(3000, generator=gen) < 0.1
+    flips2 = (flips + 1 + torch.randint(0, 37, (3000,), generator=gen)) % 39
+    bad = e ^ (1 << flips) ^ torch.where(two, 1 << flips2, torch.zeros_like(flips))
+    a, b = bad.clone(), bad.clone()
+    pa = sb.check_value_(a)
+    sa = sb.stats(reset=True)
+    pb = sb._check_value_ref(b)
+    sbb = sb.stats(reset=True)
+    assert torch.equal(pa, pb) and torch.equal(a, b) and sa == sbb
+    assert sa["node_uncorrectable"] == int(two.sum())

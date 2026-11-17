@@ -97,13 +97,13 @@ def check(d: torch.Tensor, c: torch.Tensor):
 # ---- node.value: code in the high bits --------------------------------------------------
 
 
-def encode_value(v: torch.Tensor) -> torch.Tensor:
+def _encode_value_ref(v: torch.Tensor) -> torch.Tensor:
     """Encoded copy of an int64 slot-index tensor (plain or already encoded input)."""
     d = v.to(torch.int64) & LOW
     return d | (code_of(d) << SHIFT) | MARK
 
 
-def check_value_(v: torch.Tensor) -> torch.Tensor:
+def _check_value_ref(v: torch.Tensor) -> torch.Tensor:
     """Check and correct encoded words of ``v`` in place; returns plain indices (a new tensor)."""
     if v is None or v.numel() == 0:
         return v
@@ -126,7 +126,7 @@ def plain(v: torch.Tensor) -> torch.Tensor:
 # ---- req_to_token: shadow codes, checked at the kv_indices gather -------------------------
 
 
-def shadow_encode(vals: torch.Tensor) -> torch.Tensor:
+def _shadow_encode_ref(vals: torch.Tensor) -> torch.Tensor:
     return code_of(vals).to(torch.int8)
 
 
@@ -186,6 +186,110 @@ def _check_gather_kernel(r2t, shadow, rows, lens, indptr, kv_start_idx, out, str
             tl.atomic_add(err + 3, nb)
         if nc > 0:
             tl.atomic_add(err + 5, nc)
+
+
+# ---- fused kernels: one launch per call instead of ~60 small torch ops ----------------
+
+
+def _use_triton(t: torch.Tensor) -> bool:
+    return t.is_cuda or os.environ.get("TRITON_INTERPRET") == "1"
+
+
+@triton.jit
+def _code7(d, masks, R: tl.constexpr):
+    h = d * 0
+    for k in tl.static_range(R):
+        h = h | (_par64(d & tl.load(masks + k)) << k)
+    return h | ((_par64(d) ^ _par64(h)) << R)
+
+
+@triton.jit
+def _encode_kernel(src, dst, n, masks, MODE: tl.constexpr, R: tl.constexpr, BLOCK: tl.constexpr):
+    """MODE 0: dst[i] = int8 code of src[i]; MODE 1: dst[i] = encoded int64 word."""
+    j = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = j < n
+    d = tl.load(src + j, mask=m, other=0).to(tl.int64) & 0xFFFFFFFF
+    c = _code7(d, masks, R)
+    if MODE == 0:
+        tl.store(dst + j, c.to(tl.int8), mask=m)
+    else:
+        tl.store(dst + j, d | (c << 32) | (1 << 39), mask=m)
+
+
+@triton.jit
+def _value_check_kernel(v, out, n, masks, lut_s, lut_b, err, R: tl.constexpr, BLOCK: tl.constexpr):
+    """Check encoded int64 words of ``v``, fix them in place, write plain indices to ``out``."""
+    j = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = j < n
+    w = tl.load(v + j, mask=m, other=0)
+    d = w & 0xFFFFFFFF
+    marked = m & (((w >> 39) & 1) == 1)
+    c = (w >> 32) & 127
+    h = d * 0
+    for k in tl.static_range(R):
+        h = h | (_par64(d & tl.load(masks + k)) << k)
+    s = h ^ (c & 63)
+    odd = (_par64(d) ^ _par64(c)) == 1
+    status = tl.where(odd, tl.load(lut_s + s), tl.where(s != 0, 3, 0))
+    status = tl.where(marked, status, 0)
+    bit = tl.load(lut_b + s)
+    fix_d = status == 1
+    one = d * 0 + 1
+    d2 = tl.where(fix_d, d ^ (one << tl.maximum(bit, 0)), d)
+    fix = (status == 1) | (status == 2)
+    tl.store(v + j, d2 | (_code7(d2, masks, R) << 32) | (1 << 39), mask=fix)
+    tl.store(out + j, d2, mask=m)
+    nd = tl.sum(fix_d.to(tl.int32), 0)
+    nb = tl.sum((status == 3).to(tl.int32), 0)
+    nc = tl.sum((status == 2).to(tl.int32), 0)
+    if nd > 0:
+        tl.atomic_add(err + 0, nd)
+    if nb > 0:
+        tl.atomic_add(err + 1, nb)
+    if nc > 0:
+        tl.atomic_add(err + 4, nc)
+
+
+_BLK = 1024
+
+
+def encode_value(v: torch.Tensor) -> torch.Tensor:
+    """Encoded copy of an int64 slot-index tensor (plain or already encoded input)."""
+    if not _use_triton(v):
+        return _encode_value_ref(v)
+    t = _tables(v.device)
+    src = v.contiguous()
+    out = torch.empty(src.shape, dtype=torch.int64, device=v.device)
+    n = src.numel()
+    if n:
+        _encode_kernel[(triton.cdiv(n, _BLK),)](src, out, n, t["masks"], MODE=1, R=R, BLOCK=_BLK)
+    return out
+
+
+def shadow_encode(vals: torch.Tensor) -> torch.Tensor:
+    if not _use_triton(vals):
+        return _shadow_encode_ref(vals)
+    t = _tables(vals.device)
+    src = vals.contiguous()
+    out = torch.empty(src.shape, dtype=torch.int8, device=vals.device)
+    n = src.numel()
+    if n:
+        _encode_kernel[(triton.cdiv(n, _BLK),)](src, out, n, t["masks"], MODE=0, R=R, BLOCK=_BLK)
+    return out
+
+
+def check_value_(v: torch.Tensor) -> torch.Tensor:
+    """Check and correct encoded words of ``v`` in place; returns plain indices (a new tensor)."""
+    if v is None or v.numel() == 0:
+        return v
+    if not _use_triton(v) or not v.is_contiguous():
+        return _check_value_ref(v)
+    t = _tables(v.device)
+    out = torch.empty_like(v)
+    n = v.numel()
+    _value_check_kernel[(triton.cdiv(n, _BLK),)](v, out, n, t["masks"], t["lut_s"], t["lut_b"], t["err"],
+                                                 R=R, BLOCK=_BLK)
+    return out
 
 
 def check_gather(r2t, shadow, rows, lens, indptr, kv_start_idx, out) -> None:
