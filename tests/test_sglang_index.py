@@ -126,3 +126,14 @@ def test_kernels_match_reference_paths():
     sbb = sb.stats(reset=True)
     assert torch.equal(pa, pb) and torch.equal(a, b) and sa == sbb
     assert sa["node_uncorrectable"] == int(two.sum())
+
+
+def test_check_once_per_step():
+    _reset()
+    v = sb.encode_value(torch.arange(1, 65, dtype=torch.int64))
+    p1 = sb.check_value_once(v)
+    v[5] ^= 1 << 3  # flip after the first check in the same step: reused copy, not rechecked
+    assert sb.check_value_once(v) is p1
+    sb.next_step()
+    p2 = sb.check_value_once(v)
+    assert int(p2[5]) == 6 and sb.stats(reset=True)["node_corrected"] == 1

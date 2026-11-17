@@ -41,7 +41,7 @@ SHIFT = 32
 MARK = 1 << 39
 R = 6  # Hamming check bits for 32 data bits
 
-_state = {"dev": None, "err": None, "r2t_pool": None}
+_state = {"dev": None, "err": None, "r2t_pool": None, "step": 0, "seen": {}}
 # err: [0] node corrected, [1] node uncorrectable, [2] req_to_token corrected,
 #      [3] req_to_token uncorrectable, [4] node / [5] req_to_token check-bit-only errors fixed
 
@@ -292,6 +292,31 @@ def check_value_(v: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def check_value_once(v: torch.Tensor) -> torch.Tensor:
+    """``check_value_`` at most once per forward step for the same tensor object.
+
+    The scheduler matches every waiting request against the tree on every step (LPM ordering,
+    then admission), so a shared node is matched many times between two forwards. The first
+    match of a step checks and corrects the node; later ones reuse its plain copy. Node values
+    are replaced, not mutated, on split / evict, so the tensor object identifies the content.
+    """
+    import weakref
+
+    seen = _state["seen"]
+    hit = seen.get(id(v))
+    if hit is not None and hit[0]() is v and hit[1] == _state["step"]:
+        return hit[2]
+    out = check_value_(v)
+    seen[id(v)] = (weakref.ref(v), _state["step"], out)
+    return out
+
+
+def next_step() -> None:
+    _state["step"] += 1
+    if len(_state["seen"]) > 4096:
+        _state["seen"].clear()
+
+
 def check_gather(r2t, shadow, rows, lens, indptr, kv_start_idx, out) -> None:
     t = _tables(r2t.device)
     bs = int(lens.numel())
@@ -369,6 +394,7 @@ def install() -> None:
                          kind=kt.IdSpaceKind.FULL, token_mapping=None):
         res = orig_pack(self, plan, req_pool_indices=req_pool_indices, seq_lens=seq_lens, indptr=indptr, out=out,
                         kv_start_idx=kv_start_idx, kind=kind, token_mapping=token_mapping)
+        next_step()
         pool = _state["r2t_pool"]
         if (pool is not None and token_mapping is None and not self._reads_translated(kind)
                 and self.req_to_token is pool.req_to_token):
@@ -402,7 +428,7 @@ def install() -> None:
 
     def _match_prefix_helper(self, key):
         value, *rest = orig_helper(self, key)
-        value = [check_value_(v) if isinstance(v, torch.Tensor) and v.dtype == torch.int64 else v for v in value]
+        value = [check_value_once(v) if isinstance(v, torch.Tensor) and v.dtype == torch.int64 else v for v in value]
         return (value, *rest)
 
     orig_free = tok.TokenToKVPoolAllocator.free
