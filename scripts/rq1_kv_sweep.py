@@ -337,8 +337,18 @@ def main() -> None:
                "target": a.target, "node": a.node}
         try:
             st0 = hook(cmd_dir, {"op": "secded_stats", "reset": True})
+            # other modules' counters (C, D, B), when the server has them; reset before the trial
+            other = {}
+            for op in ("recover_stats", "replica_stats", "index_stats"):
+                try:
+                    if hook(cmd_dir, {"op": op, "reset": True}, timeout=10).get("enabled"):
+                        other[op] = True
+                except Exception:
+                    pass
             outs, inj, _, secs = run_flow(a.url, cmd_dir, prompts, inject, a.warm_new, a.max_new, at, a.warm_child)
             rec["secded"] = hook(cmd_dir, {"op": "secded_stats"}) if st0.get("enabled") else None
+            for op in other:
+                rec[op.replace("_stats", "")] = hook(cmd_dir, {"op": op})
             rec["node_depth"] = inj.get("node_depth")
             rec["node_tokens"] = inj.get("node_tokens")
             diffs = [first_diff(o, g) for o, g in zip(outs, g1)]
