@@ -23,7 +23,7 @@ harmful (silent output changes from low-bit flips):
   ``node.value``; ``free`` encodes what it returns to the list, ``alloc`` checks and strips
   what it hands out, so a flip in the free list cannot hand out a slot another node owns.
 * ``seq_lens`` (int64, GPU): the scheduler keeps an exact CPU mirror (``seq_lens_cpu``);
-  before each forward the GPU copy is replaced by the mirror and mismatches are counted.
+  after ``prepare_for_decode`` / ``prepare_for_extend`` the GPU copy is replaced by the mirror and mismatches are counted.
 
 Not covered yet: cross-recovery of uncorrectable entries (node.value <-> req_to_token).
 
@@ -466,17 +466,27 @@ def install() -> None:
 
     from sglang.srt.managers import schedule_batch as sbm
 
-    orig_mwb = sbm.ScheduleBatch.get_model_worker_batch
-
-    def get_model_worker_batch(self, *args, **kwargs):
-        gl, cl = getattr(self, "seq_lens", None), getattr(self, "seq_lens_cpu", None)
+    def _restore_seq_lens(batch):
+        gl, cl = getattr(batch, "seq_lens", None), getattr(batch, "seq_lens_cpu", None)
         if (isinstance(gl, torch.Tensor) and isinstance(cl, torch.Tensor) and gl.numel()
                 and gl.shape == cl.shape and gl.dtype == cl.dtype):
             fresh = cl.to(gl.device, non_blocking=True)
             t = _tables(gl.device)
             t["err"][6] += (gl != fresh).sum().to(torch.int32)
-            self.seq_lens = fresh  # new tensor, like prepare_for_decode does
-        return orig_mwb(self, *args, **kwargs)
+            batch.seq_lens = fresh  # new tensor, like prepare_for_decode does
+
+    orig_pfd = sbm.ScheduleBatch.prepare_for_decode
+    orig_pfe = sbm.ScheduleBatch.prepare_for_extend
+
+    def prepare_for_decode(self, *args, **kwargs):
+        res = orig_pfd(self, *args, **kwargs)
+        _restore_seq_lens(self)
+        return res
+
+    def prepare_for_extend(self, *args, **kwargs):
+        res = orig_pfe(self, *args, **kwargs)
+        _restore_seq_lens(self)
+        return res
 
     mp.ReqToTokenPool.__init__ = r2t_init
     mp.ReqToTokenPool.write = r2t_write
@@ -489,5 +499,6 @@ def install() -> None:
     tok.TokenToKVPoolAllocator.clear = clear
     tok.TokenToKVPoolAllocator.alloc = alloc
     tok.TokenToKVPoolAllocator.get_all_free_pages = get_all_free_pages
-    sbm.ScheduleBatch.get_model_worker_batch = get_model_worker_batch
+    sbm.ScheduleBatch.prepare_for_decode = prepare_for_decode
+    sbm.ScheduleBatch.prepare_for_extend = prepare_for_extend
     urc.UnifiedRadixCache._rm_index = True

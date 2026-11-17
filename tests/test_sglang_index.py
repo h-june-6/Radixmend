@@ -137,3 +137,31 @@ def test_check_once_per_step():
     sb.next_step()
     p2 = sb.check_value_once(v)
     assert int(p2[5]) == 6 and sb.stats(reset=True)["node_corrected"] == 1
+
+
+def test_install_targets_exist_in_sglang():
+    """Every attribute install() wraps must exist in the installed SGLang (runs where SGLang is installed)."""
+    pytest.importorskip("sglang")
+    import importlib
+
+    targets = {
+        "sglang.srt.mem_cache.memory_pool": [("ReqToTokenPool", "__init__"), ("ReqToTokenPool", "write")],
+        "sglang.srt.mem_cache.allocation": [(None, "write_cache_indices")],
+        "sglang.srt.mem_cache.kv_index_translator": [("KVIndexTranslator", "pack_read_stream"),
+                                                     ("KVIndexTranslator", "_reads_translated")],
+        "sglang.srt.mem_cache.unified_radix_cache": [("UnifiedRadixCache", "insert")],
+        "sglang.srt.mem_cache.unified_cache.unified_tree_core": [
+            ("UnifiedTreeCore", "collect_full_device_indices"), ("UnifiedTreeCore", "_match_prefix_helper")],
+        "sglang.srt.mem_cache.allocator.token": [("TokenToKVPoolAllocator", a)
+                                                 for a in ("free", "clear", "alloc", "get_all_free_pages")],
+        "sglang.srt.managers.schedule_batch": [("ScheduleBatch", "prepare_for_decode"),
+                                               ("ScheduleBatch", "prepare_for_extend")],
+    }
+    missing = []
+    for mod, attrs in targets.items():
+        m = importlib.import_module(mod)
+        for cls, attr in attrs:
+            obj = m if cls is None else getattr(m, cls, None)
+            if obj is None or not hasattr(obj, attr):
+                missing.append(f"{mod}.{cls}.{attr}")
+    assert not missing, missing
