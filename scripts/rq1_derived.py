@@ -43,7 +43,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rq1_kv_sweep as kv  # noqa: E402
 
-STAT_OPS = ("hash_stats", "secded_stats", "recover_stats")
+STAT_OPS = ("hash_stats", "secded_stats", "recover_stats", "replica_stats")
 FOLLOW_UP = "Thanks. Can you summarize that in one sentence?"
 
 
