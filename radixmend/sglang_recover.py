@@ -48,7 +48,8 @@ _state = {
     "poison": None, "n_poisoned": 0, "pending": [], "victims": [],
     "stats": {"detections": 0, "bad_slots": 0, "reqs_retracted": 0, "matches_blocked": 0,
               "tokens_repaired": 0, "steps_with_errors": 0,
-              "chunked_skipped": 0, "overlap_full_syncs": 0},
+              "chunked_skipped": 0, "overlap_full_syncs": 0,
+              "overlap_snapshot_reads": 0, "overlap_item_reads": 0},
 }
 
 
@@ -77,9 +78,30 @@ def new_bad_slots() -> torch.Tensor | None:
     return torch.unique(slots)
 
 
-def new_bad_slots_overlap() -> torch.Tensor | None:
+def snapshot_logn(result) -> None:
+    """Queue a copy of the error-log count into pinned host memory on the current stream.
+
+    Called from ``GenerationBatchResult.copy_to_cpu`` (overlap scheduling), i.e. on the
+    result-copy stream right before ``copy_done`` is recorded, so the snapshot holds the count
+    as of the end of this step's forward and is ready once ``copy_done`` is synchronized.
+    Reading ``logn.item()`` instead would wait for the in-flight next step as well.
+    """
+    from radixmend import sglang_secded as ss
+
+    logn = ss._state.get("logn")
+    if logn is None or not logn.is_cuda:
+        return
+    host = torch.empty(logn.shape, dtype=logn.dtype, pin_memory=True)
+    host.copy_(logn, non_blocking=True)
+    logn.record_stream(torch.cuda.current_stream(logn.device))
+    result._rm_logn = host
+
+
+def new_bad_slots_overlap(snap: torch.Tensor | None = None) -> torch.Tensor | None:
     """``new_bad_slots`` while the next step may already be running (overlap scheduling).
 
+    ``snap`` is the host copy of the log count taken at the end of the step being processed
+    (``snapshot_logn``); without one the device count is read (a sync on the in-flight step).
     Kernels of the in-flight step may be appending to the log, and an entry is written after
     its index is taken, so the log is read (and reset) only after a full device synchronize.
     That synchronize happens only on steps that logged something, i.e. after an error.
@@ -87,11 +109,20 @@ def new_bad_slots_overlap() -> torch.Tensor | None:
     from radixmend import sglang_secded as ss
 
     logn = ss._state.get("logn")
-    if logn is None or int(logn.item()) == 0:
+    if logn is None:
+        return None
+    st = _state["stats"]
+    if snap is not None:
+        st["overlap_snapshot_reads"] += 1
+        n = int(snap.reshape(-1)[0])
+    else:
+        st["overlap_item_reads"] += 1
+        n = int(logn.item())
+    if n == 0:
         return None
     if logn.is_cuda:
         torch.cuda.synchronize(logn.device)
-        _state["stats"]["overlap_full_syncs"] += 1
+        st["overlap_full_syncs"] += 1
     return new_bad_slots()
 
 
@@ -231,7 +262,7 @@ def _victims_of(batch, r2t, bad, chunked) -> list:
     return [reqs[i] for i in rows]
 
 
-def handle_step_overlap(sched, batch, run_orig) -> None:
+def handle_step_overlap(sched, batch, run_orig, snap=None) -> None:
     """Overlap scheduling: step N's result is processed after step N+1 was launched.
 
     Requests that read a bad slot (in step N, or in the in-flight step N+1 that shares
@@ -240,7 +271,7 @@ def handle_step_overlap(sched, batch, run_orig) -> None:
     requeued at the next ``update_running_batch``, the point where SGLang itself retracts
     requests under memory pressure while a step is in flight.
     """
-    bad = new_bad_slots_overlap()
+    bad = new_bad_slots_overlap(snap)
     if bad is not None:
         st = _state["stats"]
         st["steps_with_errors"] += 1
@@ -283,6 +314,7 @@ def install() -> None:
     if os.environ.get("RADIXMEND_RECOVER") != "1":
         return
     from sglang.srt.managers import scheduler as sm
+    from sglang.srt.managers import utils as mu
     from sglang.srt.mem_cache import memory_pool as mp
     from sglang.srt.mem_cache import unified_radix_cache as urc
     from sglang.srt.mem_cache.base_prefix_cache import zero_match_result
@@ -336,8 +368,15 @@ def install() -> None:
         if getattr(result, "copy_done", None) is not None:
             result.copy_done.synchronize()
         if getattr(self, "enable_overlap", False):
-            return handle_step_overlap(self, batch, lambda: orig_pbr(self, batch, result))
+            snap = getattr(result, "_rm_logn", None)
+            return handle_step_overlap(self, batch, lambda: orig_pbr(self, batch, result), snap)
         handle_step(self, batch, lambda: orig_pbr(self, batch, result))
+
+    orig_c2c = mu.GenerationBatchResult.copy_to_cpu
+
+    def copy_to_cpu(self, *args, **kwargs):
+        snapshot_logn(self)
+        return orig_c2c(self, *args, **kwargs)
 
     orig_urb = sm.Scheduler.update_running_batch
 
@@ -354,4 +393,5 @@ def install() -> None:
     urc.UnifiedRadixCache.insert = insert
     sm.Scheduler.process_batch_result = process_batch_result
     sm.Scheduler.update_running_batch = update_running_batch
+    mu.GenerationBatchResult.copy_to_cpu = copy_to_cpu
     urc.UnifiedRadixCache._rm_recover = True

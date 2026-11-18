@@ -185,11 +185,47 @@ def test_overlap_without_errors_just_runs():
     assert calls == [1]
 
 
+def test_overlap_uses_host_snapshot_not_device_count():
+    make_pool()
+    sr._state["victims"].clear()
+    set_log([5])  # device log has an entry, but the snapshot of step N says 0: it belongs to step N+1
+    before = sr.stats()
+    calls = []
+    sched = SimpleNamespace(running_batch=None)
+    sr.handle_step_overlap(sched, SimpleNamespace(reqs=[]), lambda: calls.append(1),
+                           torch.zeros(1, dtype=torch.int32))
+    st = sr.stats()
+    assert calls == [1] and st["overlap_snapshot_reads"] == before["overlap_snapshot_reads"] + 1
+    assert st["overlap_item_reads"] == before["overlap_item_reads"]
+    assert st["detections"] == before["detections"]   # left for the next step's snapshot
+    assert int(ss._state["logn"]) == 1
+
+
+def test_overlap_snapshot_nonzero_reads_log():
+    make_pool()
+    sr._state["victims"].clear()
+    a = Req("a", pool_idx=0, n_tokens=2)
+    running, r2t, _, _ = fake_batch([a], [[5, 6]])
+    set_log([5])
+    sched = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=r2t), running_batch=running)
+    sr.handle_step_overlap(sched, SimpleNamespace(reqs=[a]), lambda: None, torch.ones(1, dtype=torch.int32))
+    assert a.is_retracted and int(ss._state["logn"]) == 0
+    sr._state["victims"].clear()
+
+
+def test_snapshot_logn_skips_cpu_log():
+    set_log([])
+    r = SimpleNamespace()
+    sr.snapshot_logn(r)  # CPU log (tests): nothing to snapshot, falls back to logn.item()
+    assert not hasattr(r, "_rm_logn")
+
+
 def test_install_targets_exist_in_sglang():
     import pytest
 
     pytest.importorskip("sglang")
     from sglang.srt.managers import scheduler as sm
+    from sglang.srt.managers import utils as mu
     from sglang.srt.mem_cache import base_prefix_cache as bpc
     from sglang.srt.mem_cache import memory_pool as mp
     from sglang.srt.mem_cache import unified_radix_cache as urc
@@ -197,5 +233,6 @@ def test_install_targets_exist_in_sglang():
     for obj, attr in [(sm.Scheduler, "process_batch_result"), (sm.Scheduler, "update_running_batch"),
                       (sm.Scheduler, "_add_request_to_queue"), (mp.MHATokenToKVPool, "set_kv_buffer"),
                       (mp, "unwrap_write_loc"), (urc.UnifiedRadixCache, "match_prefix"),
-                      (urc.UnifiedRadixCache, "insert"), (bpc, "zero_match_result")]:
+                      (urc.UnifiedRadixCache, "insert"), (bpc, "zero_match_result"),
+                      (mu.GenerationBatchResult, "copy_to_cpu")]:
         assert hasattr(obj, attr), attr
