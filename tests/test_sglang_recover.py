@@ -148,3 +148,52 @@ def test_log_fake_feeds_new_bad_slots():
     assert ss.log_fake([(7, 0, 2), (9, 1, 6)]) == 2
     assert ss.error_log()["total"] == 2
     assert sr.new_bad_slots().tolist() == [7, 9]
+
+
+def test_overlap_marks_victims_then_retracts_at_update_running_batch():
+    make_pool()
+    sr._state["victims"].clear()
+    a, b, c = Req("a"), Req("b"), Req("c")
+    # step N batch (a, b) and the running batch of the in-flight step N+1 (a, b, c)
+    batch, r2t, _, _ = fake_batch([a, b], [[1, 2, 3], [4, 5]])
+    running, r2t_run, released, kept = fake_batch([a, b, c], [[1, 2, 3], [4, 5, 6], [7, 9]])
+    queued, seen = [], {}
+
+    def run_orig():
+        seen.update(a=a.is_retracted, b=b.is_retracted, c=c.is_retracted)
+
+    sched = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=r2t_run), running_batch=running,
+                            _add_request_to_queue=lambda r, is_retracted: queued.append((r.name, is_retracted)))
+    set_log([5, 9])  # 5: read by b in step N; 9: read by c only in step N+1
+    sr.handle_step_overlap(sched, batch, run_orig)
+    assert seen == {"a": False, "b": True, "c": True}  # commit of step N already skips b (and c)
+    assert not released and not queued                # nothing released while N+1 is in flight
+    sr.retract_pending(sched, running)                 # next update_running_batch
+    assert released == ["b", "c"] and kept == [0]
+    assert queued == [("b", True), ("c", True)] and not sr._state["victims"]
+    assert sr.stats()["reqs_retracted"] == 2
+
+
+def test_overlap_without_errors_just_runs():
+    make_pool()
+    set_log([])
+    calls = []
+    sched = SimpleNamespace(running_batch=None)
+    sr.handle_step_overlap(sched, SimpleNamespace(reqs=[]), lambda: calls.append(1))
+    assert calls == [1]
+
+
+def test_install_targets_exist_in_sglang():
+    import pytest
+
+    pytest.importorskip("sglang")
+    from sglang.srt.managers import scheduler as sm
+    from sglang.srt.mem_cache import base_prefix_cache as bpc
+    from sglang.srt.mem_cache import memory_pool as mp
+    from sglang.srt.mem_cache import unified_radix_cache as urc
+
+    for obj, attr in [(sm.Scheduler, "process_batch_result"), (sm.Scheduler, "update_running_batch"),
+                      (sm.Scheduler, "_add_request_to_queue"), (mp.MHATokenToKVPool, "set_kv_buffer"),
+                      (mp, "unwrap_write_loc"), (urc.UnifiedRadixCache, "match_prefix"),
+                      (urc.UnifiedRadixCache, "insert"), (bpc, "zero_match_result")]:
+        assert hasattr(obj, attr), attr

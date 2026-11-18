@@ -1,8 +1,7 @@
 """Module C (minimal): recovery from errors module A can detect but not correct.
 
-Inside SGLang v0.5.22, on top of ``sglang_secded`` (module A). Requires
-``--disable-overlap-schedule`` (the result of a step is processed before the
-next step is scheduled).
+Inside SGLang v0.5.22, on top of ``sglang_secded`` (module A). Works with and
+without overlap scheduling.
 
 When module A finds an uncorrectable (2-bit) vector it appends (slot, head,
 layer, K/V, path) to its error log. After every forward this module:
@@ -24,11 +23,15 @@ layer, K/V, path) to its error log. After every forward this module:
 So a 2-bit error costs a recompute of the affected requests instead of a
 silently wrong output, and derived contamination cannot reach the tree.
 
+With overlap scheduling the result of step N is processed after step N+1 was launched;
+see ``handle_step_overlap``: victims are marked retracted before step N is committed and
+released at the next ``update_running_batch``.
+
 Enable with ``RADIXMEND_RECOVER=1`` (needs ``RADIXMEND_SECDED=1``). This module
 consumes module A's error log every step, so the ``secded_log`` hook op sees it
 empty; use ``recover_stats`` instead. Limits of the minimal version: a bad slot
 inside a request that is still in chunked prefill is not retracted (counted in
-``chunked_skipped``), and overlap scheduling is not supported.
+``chunked_skipped``).
 """
 
 from __future__ import annotations
@@ -41,10 +44,10 @@ import torch
 log = logging.getLogger(__name__)
 
 _state = {
-    "poison": None, "n_poisoned": 0, "pending": [],
+    "poison": None, "n_poisoned": 0, "pending": [], "victims": [],
     "stats": {"detections": 0, "bad_slots": 0, "reqs_retracted": 0, "matches_blocked": 0,
               "tokens_repaired": 0, "steps_with_errors": 0,
-              "chunked_skipped": 0},
+              "chunked_skipped": 0, "overlap_full_syncs": 0},
 }
 
 
@@ -71,6 +74,24 @@ def new_bad_slots() -> torch.Tensor | None:
     logn.zero_()
     _state["stats"]["detections"] += n
     return torch.unique(slots)
+
+
+def new_bad_slots_overlap() -> torch.Tensor | None:
+    """``new_bad_slots`` while the next step may already be running (overlap scheduling).
+
+    Kernels of the in-flight step may be appending to the log, and an entry is written after
+    its index is taken, so the log is read (and reset) only after a full device synchronize.
+    That synchronize happens only on steps that logged something, i.e. after an error.
+    """
+    from radixmend import sglang_secded as ss
+
+    logn = ss._state.get("logn")
+    if logn is None or int(logn.item()) == 0:
+        return None
+    if logn.is_cuda:
+        torch.cuda.synchronize(logn.device)
+        _state["stats"]["overlap_full_syncs"] += 1
+    return new_bad_slots()
 
 
 def affected_rows(req_to_token: torch.Tensor, pool_idx: torch.Tensor, seq_lens: torch.Tensor,
@@ -190,6 +211,62 @@ def handle_step(sched, batch, run_orig) -> None:
     log.warning("radixmend: %d uncorrectable slot(s), retracted %d request(s)", int(bad.numel()), len(victims))
 
 
+def _victims_of(batch, r2t, bad, chunked) -> list:
+    if batch is None or not getattr(batch, "reqs", None):
+        return []
+    idx = affected_rows(r2t, batch.req_pool_indices, batch.seq_lens, bad)
+    return [batch.reqs[i] for i in idx if not batch.reqs[i].finished() and batch.reqs[i] is not chunked]
+
+
+def handle_step_overlap(sched, batch, run_orig) -> None:
+    """Overlap scheduling: step N's result is processed after step N+1 was launched.
+
+    Requests that read a bad slot (in step N, or in the in-flight step N+1 that shares
+    ``running_batch``) are marked retracted *before* SGLang commits step N, so their output
+    is dropped; they stay marked so step N+1's result is dropped too. They are released and
+    requeued at the next ``update_running_batch``, the point where SGLang itself retracts
+    requests under memory pressure while a step is in flight.
+    """
+    bad = new_bad_slots_overlap()
+    if bad is not None:
+        st = _state["stats"]
+        st["steps_with_errors"] += 1
+        poison(bad)
+        r2t = sched.req_to_token_pool.req_to_token
+        chunked = getattr(sched, "chunked_req", None)
+        seen = {id(r) for r in _state["victims"]}
+        for b in (batch, getattr(sched, "running_batch", None)):
+            for r in _victims_of(b, r2t, bad, chunked):
+                if id(r) not in seen:
+                    seen.add(id(r))
+                    r.is_retracted = True
+                    _state["victims"].append(r)
+        if chunked is not None and any(r is chunked for r in (batch.reqs or [])):
+            if affected_rows(r2t, batch.req_pool_indices, batch.seq_lens, bad):
+                st["chunked_skipped"] += 1
+    run_orig()
+
+
+def retract_pending(sched, batch) -> None:
+    """Release and requeue the marked victims that are in ``batch`` (the running decode batch)."""
+    if not _state["victims"] or batch is None or not getattr(batch, "reqs", None):
+        return
+    pos = {id(r): i for i, r in enumerate(batch.reqs)}
+    here = [r for r in _state["victims"] if id(r) in pos]
+    if not here:
+        return
+    vic = {id(r) for r in here}
+    keep = [i for i, r in enumerate(batch.reqs) if id(r) not in vic]
+    for n, r in enumerate(here):
+        batch.release_req(pos[id(r)], len(here) - n, offload_kv=False)
+    batch.filter_batch(keep_indices=keep)
+    for r in here:
+        sched._add_request_to_queue(r, is_retracted=True)
+    _state["victims"] = [r for r in _state["victims"] if id(r) not in vic and not r.finished()]
+    _state["stats"]["reqs_retracted"] += len(here)
+    log.warning("radixmend: retracted %d request(s) that read uncorrectable slots", len(here))
+
+
 def install() -> None:
     if os.environ.get("RADIXMEND_RECOVER") != "1":
         return
@@ -244,15 +321,25 @@ def install() -> None:
     orig_pbr = sm.Scheduler.process_batch_result
 
     def process_batch_result(self, batch, result):
-        if getattr(self, "enable_overlap", False):
-            return orig_pbr(self, batch, result)
         if getattr(result, "copy_done", None) is not None:
             result.copy_done.synchronize()
+        if getattr(self, "enable_overlap", False):
+            return handle_step_overlap(self, batch, lambda: orig_pbr(self, batch, result))
         handle_step(self, batch, lambda: orig_pbr(self, batch, result))
+
+    orig_urb = sm.Scheduler.update_running_batch
+
+    def update_running_batch(self, batch):
+        retract_pending(self, batch)
+        if batch is not None and batch.is_empty():
+            batch.batch_is_full = False
+            return batch
+        return orig_urb(self, batch)
 
     mp.MHATokenToKVPool.__init__ = __init__
     mp.MHATokenToKVPool.set_kv_buffer = set_kv_buffer
     urc.UnifiedRadixCache.match_prefix = match_prefix
     urc.UnifiedRadixCache.insert = insert
     sm.Scheduler.process_batch_result = process_batch_result
+    sm.Scheduler.update_running_batch = update_running_batch
     urc.UnifiedRadixCache._rm_recover = True
