@@ -85,8 +85,16 @@ def trial(a, cmd_dir: Path, warm, prompts, shared, inject):
         if a.when == "decode":
             op["after_tokens"] = a.after_tokens
             cid = dv.send_cmd(cmd_dir, op)
+            cid2 = None
+            if inject.get("fake_detect") and a.fake_steps == 2:
+                # second report of the same vectors a.fake_gap tokens later: a control for
+                # trials where module C saw errors in two steps (two rounds of retract)
+                cid2 = dv.send_cmd(cmd_dir, dict(op, after_tokens=a.after_tokens + a.fake_gap))
             outs, secs, wall = burst(a.url, prompts, a.max_new)
             inj = dv.wait_done(cmd_dir, cid, 5.0)
+            if cid2 is not None and dv.wait_done(cmd_dir, cid2, 5.0) is None:
+                kv.hook(cmd_dir, {"op": "cancel", "target_id": cid2})
+                inj = dict(inj or {}, second_not_triggered=True)
             if inj is None:
                 kv.hook(cmd_dir, {"op": "cancel", "target_id": cid})
                 inj = {"flips": [], "not_triggered": True}
@@ -141,6 +149,9 @@ def main() -> None:
     ap.add_argument("--after-tokens", type=int, default=4)
     ap.add_argument("--warm-twice", action="store_true",
                     help="send the warm prompt twice (module D makes its replica on the first reuse)")
+    ap.add_argument("--fake-steps", type=int, choices=[1, 2], default=1,
+                    help="kind fake: report the vectors in one step or in two steps")
+    ap.add_argument("--fake-gap", type=int, default=1, help="output tokens between the two fake reports")
     ap.add_argument("--summarize", action="store_true")
     a = ap.parse_args()
     out = Path(a.out)
@@ -179,6 +190,8 @@ def main() -> None:
     for kind, bits, rep in todo:
         pa, pb = (int(x) for x in bits.split(":"))
         tid = f"blast-n{a.n}-{a.when}-{kind}-each{pa:02d}x{pb:02d}-r{rep:03d}"
+        if kind == "fake" and a.fake_steps == 2:
+            tid = tid.replace("-fake-", "-fake2-")
         if tid in done:
             continue
         seed = int(hashlib.sha256(tid.encode()).hexdigest()[:8], 16)
@@ -191,6 +204,21 @@ def main() -> None:
         try:
             outs, secs, wall, inj, stats = trial(a, cmd_dir, warm, prompts, shared, inject)
             changed = [i for i, (x, y) in enumerate(zip(outs, golden)) if x != y]
+            rec["diverge"] = {i: next((t for t, (x, y) in enumerate(zip(outs[i], golden[i])) if x != y),
+                                      min(len(outs[i]), len(golden[i]))) for i in changed}
+            # retract records from module C: output tokens already committed when the request
+            # was marked; committed_ok=False means a token sent before the retract is wrong
+            by_hash = {hash(tuple(int(t) for t in p)): i for i, p in enumerate(prompts)}
+            vl = []
+            for v in (stats.get("recover_stats") or {}).get("victim_log") or []:
+                i = by_hash.get(v["h"])
+                if i is None:
+                    continue
+                vl.append({"req": i, "at": len(v["out"]), "committed_ok": v["out"] == golden[i][: len(v["out"])]})
+            rec["victims"] = vl
+            rec["committed_bad"] = sorted({v["req"] for v in vl if not v["committed_ok"]})
+            if isinstance(stats.get("recover_stats"), dict):
+                stats["recover_stats"].pop("victim_log", None)
             rec.update(n_changed=len(changed), changed=changed, secs=[round(s, 4) for s in secs],
                        wall=round(wall, 4), inject={k: v for k, v in inj.items() if k != "flips"},
                        flips=inj.get("flips", []), stats=stats)

@@ -45,7 +45,7 @@ from types import SimpleNamespace
 log = logging.getLogger(__name__)
 
 _state = {
-    "poison": None, "n_poisoned": 0, "pending": [], "victims": [],
+    "poison": None, "n_poisoned": 0, "pending": [], "victims": [], "vlog": [],
     "stats": {"detections": 0, "bad_slots": 0, "reqs_retracted": 0, "matches_blocked": 0,
               "tokens_repaired": 0, "steps_with_errors": 0,
               "chunked_skipped": 0, "overlap_full_syncs": 0,
@@ -193,11 +193,21 @@ def repair_on_insert(pool, token_ids, value) -> int:
 
 
 def stats(reset: bool = False) -> dict:
-    out = dict(_state["stats"], poisoned_now=_state["n_poisoned"], pending=len(_state["pending"]))
+    out = dict(_state["stats"], poisoned_now=_state["n_poisoned"], pending=len(_state["pending"]),
+               victim_log=list(_state["vlog"]))
     if reset:
+        _state["vlog"].clear()
         for k in _state["stats"]:
             _state["stats"][k] = 0
     return out
+
+
+def _note_victim(r) -> None:
+    """Record a request as it is marked for retract: which prompt (hash of its input ids) and
+    the output tokens already committed at that moment (diagnostics for the blast runs)."""
+    if len(_state["vlog"]) < 512:
+        _state["vlog"].append({"h": hash(tuple(int(t) for t in r.origin_input_ids)),
+                               "out": [int(t) for t in r.output_ids]})
 
 
 def handle_step(sched, batch, run_orig) -> None:
@@ -218,6 +228,7 @@ def handle_step(sched, batch, run_orig) -> None:
     proc = sched.batch_result_processor
     old_overlap = proc.enable_overlap
     for r in victims:
+        _note_victim(r)
         r.is_retracted = True  # SGLang then skips the step's commit for these requests
     if victims and batch.forward_mode.is_decode():
         # the decode loop honours is_retracted only in overlap mode; the processor is a
@@ -283,6 +294,7 @@ def handle_step_overlap(sched, batch, run_orig, snap=None) -> None:
             for r in _victims_of(b, r2t, bad, chunked):
                 if id(r) not in seen:
                     seen.add(id(r))
+                    _note_victim(r)
                     r.is_retracted = True
                     _state["victims"].append(r)
         if chunked is not None and _victims_of(SimpleNamespace(reqs=[chunked]), r2t, bad, None):
