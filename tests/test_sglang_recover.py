@@ -85,8 +85,10 @@ class Proc:  # like SGLang's SchedulerBatchResultProcessor
 
 
 class Req:
-    def __init__(self, name, done=False):
+    def __init__(self, name, done=False, pool_idx=None, n_tokens=0):
         self.name, self.done, self.is_retracted = name, done, False
+        self.kv = SimpleNamespace(req_pool_idx=pool_idx)
+        self.origin_input_ids, self.output_ids = [0] * n_tokens, []
 
     def finished(self):
         return self.done
@@ -153,18 +155,18 @@ def test_log_fake_feeds_new_bad_slots():
 def test_overlap_marks_victims_then_retracts_at_update_running_batch():
     make_pool()
     sr._state["victims"].clear()
-    a, b, c = Req("a"), Req("b"), Req("c")
-    # step N batch (a, b) and the running batch of the in-flight step N+1 (a, b, c)
-    batch, r2t, _, _ = fake_batch([a, b], [[1, 2, 3], [4, 5]])
-    running, r2t_run, released, kept = fake_batch([a, b, c], [[1, 2, 3], [4, 5, 6], [7, 9]])
+    # requests carry their own pool row and length; the step-N batch is a trimmed copy (no seq_lens)
+    a, b, c = Req("a", pool_idx=0, n_tokens=3), Req("b", pool_idx=1, n_tokens=3), Req("c", pool_idx=2, n_tokens=2)
+    batch = SimpleNamespace(reqs=[a, b])
+    running, r2t, released, kept = fake_batch([a, b, c], [[1, 2, 3], [4, 5, 6], [7, 9]])
     queued, seen = [], {}
 
     def run_orig():
         seen.update(a=a.is_retracted, b=b.is_retracted, c=c.is_retracted)
 
-    sched = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=r2t_run), running_batch=running,
+    sched = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=r2t), running_batch=running,
                             _add_request_to_queue=lambda r, is_retracted: queued.append((r.name, is_retracted)))
-    set_log([5, 9])  # 5: read by b in step N; 9: read by c only in step N+1
+    set_log([5, 9])  # 5: read by b; 9: read by c only in the in-flight step
     sr.handle_step_overlap(sched, batch, run_orig)
     assert seen == {"a": False, "b": True, "c": True}  # commit of step N already skips b (and c)
     assert not released and not queued                # nothing released while N+1 is in flight

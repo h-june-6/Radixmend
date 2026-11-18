@@ -40,6 +40,7 @@ import logging
 import os
 
 import torch
+from types import SimpleNamespace
 
 log = logging.getLogger(__name__)
 
@@ -212,10 +213,22 @@ def handle_step(sched, batch, run_orig) -> None:
 
 
 def _victims_of(batch, r2t, bad, chunked) -> list:
-    if batch is None or not getattr(batch, "reqs", None):
+    """Requests of ``batch`` whose KV rows hold a bad slot.
+
+    Works from the requests themselves: the batch handed to ``process_batch_result`` under
+    overlap is a trimmed copy without ``seq_lens`` / ``req_pool_indices``. A request's row is
+    filled up to its prompt + output length (an over-estimate by at most the in-flight token,
+    which can only add a harmless extra recompute).
+    """
+    reqs = [r for r in (getattr(batch, "reqs", None) or [])
+            if not r.finished() and r is not chunked and getattr(getattr(r, "kv", None), "req_pool_idx", None) is not None]
+    if not reqs:
         return []
-    idx = affected_rows(r2t, batch.req_pool_indices, batch.seq_lens, bad)
-    return [batch.reqs[i] for i in idx if not batch.reqs[i].finished() and batch.reqs[i] is not chunked]
+    width = r2t.shape[1]
+    idx = torch.tensor([int(r.kv.req_pool_idx) for r in reqs], dtype=torch.int64)
+    lens = torch.tensor([min(width, len(r.origin_input_ids) + len(r.output_ids)) for r in reqs], dtype=torch.int64)
+    rows = affected_rows(r2t, idx.to(r2t.device), lens.to(r2t.device), bad)
+    return [reqs[i] for i in rows]
 
 
 def handle_step_overlap(sched, batch, run_orig) -> None:
@@ -241,9 +254,8 @@ def handle_step_overlap(sched, batch, run_orig) -> None:
                     seen.add(id(r))
                     r.is_retracted = True
                     _state["victims"].append(r)
-        if chunked is not None and any(r is chunked for r in (batch.reqs or [])):
-            if affected_rows(r2t, batch.req_pool_indices, batch.seq_lens, bad):
-                st["chunked_skipped"] += 1
+        if chunked is not None and _victims_of(SimpleNamespace(reqs=[chunked]), r2t, bad, None):
+            st["chunked_skipped"] += 1
     run_orig()
 
 
