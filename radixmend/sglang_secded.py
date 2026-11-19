@@ -220,6 +220,58 @@ def _check_fix_inplace_kernel(buf_ptr, cw_ptr, loc_ptr, indptr_ptr, nb, elab_ptr
             tl.atomic_add(cwerr_ptr, 1)
 
 
+@triton.jit
+def _check_fix_blocked_kernel(buf_ptr, cw_ptr, loc_ptr, indptr_ptr, nb, elab_ptr, bmask_ptr, inv_e_ptr,
+                              inv_b_ptr, err_ptr, cwerr_ptr, stride_s, stride_h, H, log_ptr, logn_ptr, LOGCAP,
+                              tag, BLOCK: tl.constexpr, D: tl.constexpr, E: tl.constexpr, B: tl.constexpr,
+                              POPC: tl.constexpr, REP: tl.constexpr = False, rep_map=None, rep_buf=None,
+                              rep_cw=None, rest_ptr=None):
+    """``_check_fix_inplace_kernel`` on BLOCK slots per program (same decisions, one launch
+    unit per BLOCK vectors instead of per vector; the per-vector version spent most of the
+    pre-extend time on scheduling ~2M tiny programs per prefill)."""
+    pid = tl.program_id(0)
+    h = tl.program_id(1)
+    total = tl.load(indptr_ptr + nb)
+    n = pid * BLOCK + tl.arange(0, BLOCK)
+    m = n < total
+    d = tl.arange(0, D)
+    slot = tl.load(loc_ptr + n, mask=m, other=0).to(tl.int64)
+    rows = buf_ptr + slot[:, None] * stride_s + h * stride_h + d[None, :]
+    x = tl.load(rows, mask=m[:, None], other=0).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+    c = tl.reduce(x, 1, _xor)
+    p1 = _par16(c)
+    se1 = tl.reduce(tl.where(_par16_fast(x, POPC) == 1, tl.load(elab_ptr + d)[None, :], 0), 1, _xor)
+    sb1 = _sb_of(c, bmask_ptr, B)
+    cw = tl.load(cw_ptr + slot * H + h, mask=m, other=0).to(tl.int32) & 0xFFFF
+    st, el, bt = _status(p1, se1, sb1, cw, inv_e_ptr, inv_b_ptr, E, B)
+    st = tl.where(m, st, 0)
+    if tl.max(st, 0) > 0:
+        one = st == 1
+        eptr = buf_ptr + slot * stride_s + h * stride_h + tl.where(one, el, 0)
+        xe = tl.load(eptr, mask=one, other=0).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+        fixed = (xe ^ (1 << tl.where(one, bt, 0))).to(tl.int16).to(buf_ptr.dtype.element_ty, bitcast=True)
+        tl.store(eptr, fixed, mask=one)
+        tl.atomic_add(err_ptr + 0, tl.sum(one.to(tl.int32), 0))
+        bad = st == 3
+        tl.atomic_add(err_ptr + 1, tl.sum(bad.to(tl.int32), 0))
+        unrep = bad
+        if REP:
+            rs = tl.load(rep_map + slot, mask=bad, other=-1).to(tl.int64)
+            got = bad & (rs >= 0)
+            rsafe = tl.where(got, rs, 0)
+            tl.store(rows, tl.load(rep_buf + rsafe[:, None] * stride_s + h * stride_h + d[None, :],
+                                   mask=got[:, None], other=0), mask=got[:, None])
+            tl.store(cw_ptr + slot * H + h, tl.load(rep_cw + rsafe * H + h, mask=got, other=0), mask=got)
+            tl.atomic_add(rest_ptr, tl.sum(got.to(tl.int32), 0))
+            unrep = bad & (rs < 0)
+        _log_bad(log_ptr, logn_ptr, LOGCAP, slot, h, tag, unrep)
+        ck = st == 2
+        q1 = _par16(se1) ^ _par16(sb1)
+        good = p1 | (se1 << 1) | (sb1 << (1 + E)) | (q1 << (1 + E + B))
+        tl.store(cw_ptr + slot * H + h, good.to(tl.int16), mask=ck)
+        tl.atomic_add(cwerr_ptr, tl.sum(ck.to(tl.int32), 0))
+
+
 # ---- decode stage 1 with check-on-load -------------------------------------------------
 
 
@@ -666,6 +718,8 @@ def _rep_args(k_buffer, v_buffer, layer: int, on: bool) -> dict:
 
 
 _NPROG = 512
+# pre-extend check: vectors per program (RADIXMEND_SECDED_EXT_BLOCK, 0 = one per vector, the old path)
+EXT_BLOCK = int(os.environ.get("RADIXMEND_SECDED_EXT_BLOCK", "16"))
 
 
 def count_readers(kv_indices, kv_indptr) -> None:
@@ -691,7 +745,7 @@ def shared_prepass(k_buffer, v_buffer, k_cw, v_cw, kv_indices, kv_indptr, layer:
 
 
 def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int, tag: int = 1, rep_buf=None,
-                      rep_cw=None) -> None:
+                      rep_cw=None, block: int | None = None) -> None:
     """Check the prefix slots kv_indices[:kv_indptr[-1]] of one layer buffer, fix in place
     (with ``rep_buf``/``rep_cw``: restore uncorrectable vectors that have a module D replica)."""
     t = _tables(buf.device)
@@ -699,13 +753,17 @@ def check_fix_inplace(buf, cw, kv_indices, kv_indptr, err_off: int, tag: int = 1
     n = kv_indices.numel()
     if n == 0:
         return
-    _check_fix_inplace_kernel[(n, buf.shape[1])](
-        buf, cw, kv_indices, kv_indptr, kv_indptr.numel() - 1, t["elab"], t["bmask"], t["inv_e"],
-        t["inv_b"], _state["err"][err_off:], _state["err"][9:], buf.stride(0), buf.stride(1), buf.shape[1],
-        _state["log"], _state["logn"], LOG_CAP, tag, D=buf.shape[2], E=code.e_bits, B=code.b_bits,
-        **({"REP": True, "rep_map": _state["rep"]["map"], "rep_buf": rep_buf, "rep_cw": rep_cw,
-            "rest_ptr": _state["err"][11:]} if rep_buf is not None else {}),
-    )
+    rep = ({"REP": True, "rep_map": _state["rep"]["map"], "rep_buf": rep_buf, "rep_cw": rep_cw,
+            "rest_ptr": _state["err"][11:]} if rep_buf is not None else {})
+    args = (buf, cw, kv_indices, kv_indptr, kv_indptr.numel() - 1, t["elab"], t["bmask"], t["inv_e"],
+            t["inv_b"], _state["err"][err_off:], _state["err"][9:], buf.stride(0), buf.stride(1), buf.shape[1],
+            _state["log"], _state["logn"], LOG_CAP, tag)
+    blk = EXT_BLOCK if block is None else block
+    if blk <= 0:  # reference: one program per vector
+        _check_fix_inplace_kernel[(n, buf.shape[1])](*args, D=buf.shape[2], E=code.e_bits, B=code.b_bits, **rep)
+        return
+    _check_fix_blocked_kernel[(triton.cdiv(n, blk), buf.shape[1])](
+        *args, BLOCK=blk, D=buf.shape[2], E=code.e_bits, B=code.b_bits, POPC=buf.is_cuda, **rep)
 
 
 def check_prefix(k_buffer, v_buffer, kv_indices, kv_indptr) -> bool:

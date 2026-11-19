@@ -302,3 +302,28 @@ def test_error_log_records_uncorrectable():
     log = ss.error_log(reset=True)
     assert log["entries"] == [{"slot": s1, "head": 0, "layer": 3, "kind": "v", "path": "extend"}]
     assert ss.error_log()["total"] == 0
+
+
+@pytest.mark.parametrize("block", [1, 16, 32])
+def test_blocked_prefix_check_matches_reference(block):
+    _, k, _, indptr, idx, _ = setup(seqs=(37, 70))
+    kcw = encode(k)
+    k16 = k.view(torch.int16)
+    s = [int(idx[i]) for i in (0, 5, 17, 40, 99)]
+    k16[s[0], 0, 3] ^= 1 << 14                       # 1-bit data
+    k16[s[1], 1, 127] ^= 1 << 0
+    k16[s[2], 0, 10] ^= 1 << 7                       # 2-bit (uncorrectable)
+    k16[s[2], 0, 11] ^= 1 << 7
+    kcw[s[3], 1] = (kcw[s[3], 1].to(torch.int32) ^ (1 << 5)).to(torch.int16)  # checkword hit
+    k16[s[4], 1, 64] ^= 1 << 9
+    outs = []
+    for b in (0, block):
+        kb, cb = k.clone(), kcw.clone()
+        ss._state["err"].zero_()
+        ss.error_log(reset=True)
+        ss.check_fix_inplace(kb, cb, idx, indptr, 4, tag=5, block=b)
+        outs.append((kb.view(torch.int16).clone(), cb.clone(), ss.errors(), ss.error_log(reset=True)["entries"]))
+    ref, got = outs
+    assert torch.equal(ref[0], got[0]) and torch.equal(ref[1], got[1])
+    assert ref[2] == got[2] and ref[2][4:6] == [3, 1] and ref[2][9] == 1
+    assert ref[3] == got[3] and len(ref[3]) == 1 and ref[3][0]["slot"] == s[2]
