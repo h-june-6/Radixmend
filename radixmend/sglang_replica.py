@@ -35,7 +35,8 @@ import torch
 
 log = logging.getLogger(__name__)
 
-_state = {"stats": {"replicated": 0, "replica_full": 0, "skipped_bad": 0, "invalidated_calls": 0}}
+_state = {"stats": {"replicated": 0, "replica_full": 0, "skipped_bad": 0, "invalidated_calls": 0,
+                    "match_skipped": 0}}
 
 
 def attach_pool(pool, capacity: int) -> None:
@@ -43,6 +44,7 @@ def attach_pool(pool, capacity: int) -> None:
 
     dev = pool.k_buffer[0].device
     n = pool.k_buffer[0].shape[0]
+    _state["seen"] = set()  # a new store: every node needs its replicas again
     layers = {}
     for lid, (kb, vb) in enumerate(zip(pool.k_buffer, pool.v_buffer)):
         layers[lid] = (torch.zeros((capacity,) + tuple(kb.shape[1:]), dtype=kb.dtype, device=dev),
@@ -119,6 +121,31 @@ def replicate(pool, slots: torch.Tensor) -> int:
     return int(need.numel())
 
 
+_SEEN_CAP = 1 << 20
+
+
+def first_visit(node) -> bool:
+    """True the first time a matched tree node is seen; later matches of it skip replicate().
+
+    The scheduler re-matches every waiting request each step, and replicate() needs several
+    host syncs (unique, masks, item), which stall the overlap pipeline: ~60 ms per request on
+    short shared prompts. A node's slots stay put while the node lives (eviction frees them,
+    and the replicas are dropped on GPU when the slots are rewritten), so once per node is
+    enough. Node ids are a never-reused counter; nodes without one are always processed.
+    """
+    nid = getattr(node, "id", None)
+    if nid is None:
+        return True
+    seen = _state.setdefault("seen", set())
+    if nid in seen:
+        _state["stats"]["match_skipped"] += 1
+        return False
+    if len(seen) >= _SEEN_CAP:
+        seen.clear()
+    seen.add(nid)
+    return True
+
+
 def stats(reset: bool = False) -> dict:
     from radixmend import sglang_secded as ss
 
@@ -169,7 +196,7 @@ def install() -> None:
     def match_prefix(self, params):
         res = orig_match(self, params)
         n = res.device_prefix_len
-        if n >= min_len and n > skip and _state.get("pool") is not None:
+        if n >= min_len and n > skip and _state.get("pool") is not None and first_visit(res.last_device_node):
             extra_key = getattr(params.key, "extra_key", None)
             slots = self.tree_core.collect_full_device_indices(res.last_device_node, self.root_node_handle(extra_key))
             replicate(_state["pool"], slots[skip:n])

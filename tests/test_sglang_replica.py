@@ -141,3 +141,28 @@ def test_prefix_check_restores_in_place():
     assert ss.check_prefix(pool.k_buffer[1], pool.v_buffer[1], idx, indptr)
     assert torch.equal(pool.v_buffer[1], v0)
     assert ss.errors()[11] == 1 and int(ss._state["logn"].item()) == 0
+
+
+def test_first_visit_once_per_node():
+    from types import SimpleNamespace
+
+    from radixmend import sglang_replica as sr
+
+    sr._state["seen"] = set()
+    a, b = SimpleNamespace(id=10**9 + 1), SimpleNamespace(id=10**9 + 2)
+    before = sr._state["stats"]["match_skipped"]
+    assert sr.first_visit(a) and sr.first_visit(b)
+    assert not sr.first_visit(a) and not sr.first_visit(SimpleNamespace(id=a.id))
+    assert sr._state["stats"]["match_skipped"] == before + 2
+    assert sr.first_visit(object())  # no id: always processed
+
+
+def test_first_visit_cleared_on_attach():
+    from types import SimpleNamespace
+
+    from radixmend import sglang_replica as sr
+
+    sr._state["seen"] = {123}
+    assert not sr.first_visit(SimpleNamespace(id=123))
+    sr._state["seen"] = set()  # what attach_pool does
+    assert sr.first_visit(SimpleNamespace(id=123))
