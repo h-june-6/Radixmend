@@ -45,6 +45,7 @@ def attach_pool(pool, capacity: int) -> None:
     dev = pool.k_buffer[0].device
     n = pool.k_buffer[0].shape[0]
     _state["seen"] = set()  # a new store: every node needs its replicas again
+    _state["full"] = None  # host hint: None = room may be left, else the pending free-count refresh
     layers = {}
     for lid, (kb, vb) in enumerate(zip(pool.k_buffer, pool.v_buffer)):
         layers[lid] = (torch.zeros((capacity,) + tuple(kb.shape[1:]), dtype=kb.dtype, device=dev),
@@ -81,14 +82,23 @@ def invalidate(loc: torch.Tensor) -> None:
     r["map"].index_fill_(0, loc, -1)  # no host scalar tensor: capturable in CUDA graphs
 
 
-def replicate(pool, slots: torch.Tensor) -> int:
-    """Copy (after a check + single-bit fix) the slots that have no replica yet; returns how many."""
+def replicate(pool, slots: torch.Tensor, distinct: bool = False) -> int:
+    """Copy (after a check + single-bit fix) the slots that have no replica yet; returns how many.
+
+    ``distinct=True``: the caller guarantees no repeated slot (a tree path), so torch.unique,
+    a host sync (~11 ms per call under overlap scheduling), is skipped.
+    """
     from radixmend import sglang_secded as ss
 
     r = rep()
     if r is None or slots.numel() == 0:
         return 0
-    slots = torch.unique(slots.to(torch.int64))
+    if store_full_hint(r):
+        _state["stats"]["replica_full"] += 1
+        return 0
+    slots = slots.to(torch.int64)
+    if not distinct:
+        slots = torch.unique(slots)
     need = slots[r["map"][slots] < 0]
     if need.numel() == 0:
         return 0
@@ -97,6 +107,7 @@ def replicate(pool, slots: torch.Tensor) -> int:
         _state["stats"]["replica_full"] += 1
         need = need[: free.numel()]
         if need.numel() == 0:
+            _state["full"] = {}  # no room: skip further calls until a refresh shows freed rows
             return 0
     free = free[: need.numel()]
     # verify the source first (fixes 1-bit errors in place; logs uncorrectable ones)
@@ -121,6 +132,41 @@ def replicate(pool, slots: torch.Tensor) -> int:
     return int(need.numel())
 
 
+def store_full_hint(r) -> bool:
+    """True while the store is known full, without a host sync on the match path.
+
+    Rows are freed only on the GPU (``invalidate``), so once the store was seen full the free
+    count is refreshed by an async copy into pinned memory, read on a later call when ready.
+    Before this, every match of a new group paid torch.unique/mask/nonzero syncs (~11 ms each
+    under overlap scheduling) just to find no room: +20-30% TTFT on 864-token shared prompts.
+    """
+    st = _state.get("full")
+    if st is None:
+        return False
+    if "host" in st:
+        if st["ev"] is None or st["ev"].query():
+            nfree = int(st["host"].item())  # host memory, already copied: no device sync
+            _state["full"] = None if nfree > 0 else {}
+            if nfree > 0:
+                return False
+        else:
+            return True
+    cnt = (r["owner"] < 0).sum()
+    if cnt.is_cuda:
+        host = torch.empty((), dtype=cnt.dtype, pin_memory=True)
+        host.copy_(cnt, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+    else:
+        host, ev = cnt, None
+    _state["full"] = {"host": host, "ev": ev}
+    if ev is None or ev.query():
+        nfree = int(host.item())
+        _state["full"] = None if nfree > 0 else {}
+        return nfree == 0
+    return True
+
+
 _SEEN_CAP = 1 << 20
 
 
@@ -132,8 +178,10 @@ def first_visit(node) -> bool:
     short shared prompts. A node's slots stay put while the node lives (eviction frees them,
     and the replicas are dropped on GPU when the slots are rewritten), so once per node is
     enough. Node ids are a never-reused counter; nodes without one are always processed.
+    (b6840e0 read ``node.id`` from what is already an int id, so it never skipped.)
     """
-    nid = getattr(node, "id", None)
+    # SGLang 0.5.22's unified tree returns node ids (int) as last_device_node, not nodes
+    nid = node if isinstance(node, int) else getattr(node, "id", None)
     if nid is None:
         return True
     seen = _state.setdefault("seen", set())
@@ -199,7 +247,7 @@ def install() -> None:
         if n >= min_len and n > skip and _state.get("pool") is not None and first_visit(res.last_device_node):
             extra_key = getattr(params.key, "extra_key", None)
             slots = self.tree_core.collect_full_device_indices(res.last_device_node, self.root_node_handle(extra_key))
-            replicate(_state["pool"], slots[skip:n])
+            replicate(_state["pool"], slots[skip:n], distinct=True)
         return res
 
     mp.MHATokenToKVPool.__init__ = __init__

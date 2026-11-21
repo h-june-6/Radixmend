@@ -95,8 +95,28 @@ def test_invalidate_frees_replica():
     sd.invalidate(torch.tensor([2, 50], device=DEV))  # 50 has no replica
     r = sd.rep()
     assert int(r["map"][2]) == -1 and int(r["map"][1]) >= 0
-    assert sd.replicate(pool, torch.tensor([3], device=DEV)) == 1
+    n = sd.replicate(pool, torch.tensor([3], device=DEV))
+    if n == 0:  # the free-count refresh may still be in flight on a GPU
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        n = sd.replicate(pool, torch.tensor([3], device=DEV))
+    assert n == 1
     assert sd.stats()["replicas_now"] == 2
+
+
+def test_full_store_skips_device_work(monkeypatch):
+    pool = make_pool(capacity=2)
+    assert sd.replicate(pool, torch.tensor([1, 2], device=DEV)) == 2
+    assert sd.replicate(pool, torch.tensor([3], device=DEV)) == 0  # sees full, sets the hint
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    def boom(*a, **k):
+        raise AssertionError("nonzero called while the store is known full")
+
+    monkeypatch.setattr(torch, "nonzero", boom)
+    for _ in range(3):
+        assert sd.replicate(pool, torch.tensor([4, 5], device=DEV)) == 0
 
 
 @pytest.mark.parametrize("mode", ["full", "sig"])
@@ -155,6 +175,15 @@ def test_first_visit_once_per_node():
     assert not sr.first_visit(a) and not sr.first_visit(SimpleNamespace(id=a.id))
     assert sr._state["stats"]["match_skipped"] == before + 2
     assert sr.first_visit(object())  # no id: always processed
+
+
+def test_first_visit_accepts_int_node_ids():
+    # SGLang 0.5.22 MatchResult.last_device_node is the node id itself
+    from radixmend import sglang_replica as sr
+
+    sr._state["seen"] = set()
+    assert sr.first_visit(10**9 + 7)
+    assert not sr.first_visit(10**9 + 7)
 
 
 def test_first_visit_cleared_on_attach():
