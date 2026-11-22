@@ -107,6 +107,24 @@ def test_check_gather_fixes_out_and_table():
     assert st["r2t_corrected"] == 1 and st["r2t_check_bits_fixed"] == 1 and st["r2t_uncorrectable"] == 1
 
 
+def test_check_row_fixes_table_before_checkpoint():
+    from types import SimpleNamespace
+
+    _reset()
+    dev = torch.device("cuda" if torch.cuda.is_available() and os.environ.get("TRITON_INTERPRET") != "1" else "cpu")
+    sb._state["dev"] = None
+    sb._tables(dev)
+    r2t = torch.randint(1, 180_000, (4, 300), dtype=torch.int32, device=dev)
+    pool = SimpleNamespace(req_to_token=r2t, rm_shadow=sb.shadow_encode(r2t))
+    clean = r2t.clone()
+    r2t[2, 250] ^= 1 << 4     # inside [0, 260): fixed
+    r2t[2, 280] ^= 1 << 4     # past n: left alone
+    sb.check_row(pool, 2, 260)
+    assert int(r2t[2, 250]) == int(clean[2, 250]) and int(r2t[2, 280]) != int(clean[2, 280])
+    assert torch.equal(r2t[[0, 1, 3]], clean[[0, 1, 3]])
+    assert sb.stats(reset=True)["r2t_corrected"] == 1
+
+
 def test_kernels_match_reference_paths():
     """Under TRITON_INTERPRET=1 the public functions run the fused kernels; compare with the torch refs."""
     _reset()
@@ -149,7 +167,8 @@ def test_install_targets_exist_in_sglang():
         "sglang.srt.mem_cache.allocation": [(None, "write_cache_indices")],
         "sglang.srt.mem_cache.kv_index_translator": [("KVIndexTranslator", "pack_read_stream"),
                                                      ("KVIndexTranslator", "_reads_translated")],
-        "sglang.srt.mem_cache.unified_radix_cache": [("UnifiedRadixCache", "insert")],
+        "sglang.srt.mem_cache.unified_radix_cache": [("UnifiedRadixCache", "insert"),
+                                                     ("UnifiedRadixCache", "checkpoint_into_tree")],
         "sglang.srt.mem_cache.unified_cache.unified_tree_core": [
             ("UnifiedTreeCore", "collect_full_device_indices"), ("UnifiedTreeCore", "_match_prefix_helper")],
         "sglang.srt.mem_cache.allocator.token": [("TokenToKVPoolAllocator", a)

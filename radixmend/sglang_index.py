@@ -335,6 +335,25 @@ def check_gather(r2t, shadow, rows, lens, indptr, kv_start_idx, out) -> None:
     )
 
 
+def check_row(pool, row: int, n: int) -> None:
+    """Check (and fix in place) entries [0, n) of one req_to_token row with their shadow codes.
+
+    For reads that bypass the attention gather: ``checkpoint_into_tree`` copies a request's
+    row into the radix tree, where ``insert`` would encode a flipped index as valid and share
+    it with every later request. The gather fixes the row on every forward, so this only
+    closes the window between the request's last forward and its checkpoint.
+    """
+    sh = getattr(pool, "rm_shadow", None)
+    if sh is None or n <= 0:
+        return
+    dev = pool.req_to_token.device
+    rows = torch.tensor([row], dtype=torch.int64, device=dev)
+    lens = torch.tensor([n], dtype=torch.int64, device=dev)
+    indptr = torch.zeros(1, dtype=torch.int64, device=dev)
+    out = torch.empty(n, dtype=pool.req_to_token.dtype, device=dev)  # only fixed entries are written
+    check_gather(pool.req_to_token, sh, rows, lens, indptr, None, out)
+
+
 def stats(reset: bool = False) -> dict:
     err = _state["err"]
     vals = [int(x) for x in err.tolist()] if err is not None else [0] * 7
@@ -409,6 +428,16 @@ def install() -> None:
             check_gather(pool.req_to_token, pool.rm_shadow, req_pool_indices[:bs], seq_lens, indptr,
                          kv_start_idx, out)
         return res
+
+    # a request's row enters the tree here, outside the attention gather: check it first
+    orig_ckpt = urc.UnifiedRadixCache.checkpoint_into_tree
+
+    def checkpoint_into_tree(self, req, *, up_to, **kwargs):
+        pool = _state["r2t_pool"]
+        idx = getattr(getattr(req, "kv", None), "req_pool_idx", None)
+        if pool is not None and idx is not None and self.req_to_token_pool is pool:
+            check_row(pool, int(idx), min(int(up_to), pool.req_to_token.shape[1]))
+        return orig_ckpt(self, req, up_to=up_to, **kwargs)
 
     # node.value: code in the high bits
     orig_insert = urc.UnifiedRadixCache.insert
@@ -496,6 +525,7 @@ def install() -> None:
     al.write_cache_indices = write_cache_indices
     kt.KVIndexTranslator.pack_read_stream = pack_read_stream
     urc.UnifiedRadixCache.insert = insert
+    urc.UnifiedRadixCache.checkpoint_into_tree = checkpoint_into_tree
     utc.UnifiedTreeCore.collect_full_device_indices = collect_full_device_indices
     utc.UnifiedTreeCore._match_prefix_helper = _match_prefix_helper
     tok.TokenToKVPoolAllocator.free = free

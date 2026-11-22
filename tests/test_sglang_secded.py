@@ -181,6 +181,38 @@ def test_sig_redoes_only_bad_splits():
     assert e[8] == 1 and e[2] == 1
 
 
+@pytest.mark.parametrize("sigred", [False, True])
+def test_sig_flags_same_bit_double_in_one_vector(sigred):
+    # p and S_b of the split total cancel; S_e of the per-element totals does not
+    q, k, v, indptr, idx, _ = setup()
+    kcw, vcw = encode(k), encode(v)
+    for buf in ("k", "v"):
+        k2, v2 = k.clone(), v.clone()
+        b = k2 if buf == "k" else v2
+        s1 = int(idx[10])
+        b.view(torch.int16)[s1, 0, 1] ^= 1 << 14
+        b.view(torch.int16)[s1, 0, 9] ^= 1 << 14
+        ss._state["err"].zero_()
+        run(q, k2, v2, kcw, vcw, indptr, idx, mode="sig", sigred=sigred)
+        e = ss.errors()
+        assert e[8] >= 1 and e[1 if buf == "k" else 3] == 1, e
+
+
+@pytest.mark.parametrize("sigred", [False, True])
+def test_sig_flags_two_single_flips_same_bit_two_vectors(sigred):
+    q, k, v, indptr, idx, _ = setup()
+    kcw, vcw = encode(k), encode(v)
+    v2 = v.clone()
+    v2.view(torch.int16)[int(idx[3]), 1, 5] ^= 1 << 7     # request 0, two vectors, same bit
+    v2.view(torch.int16)[int(idx[20]), 1, 60] ^= 1 << 7
+    ss._state["err"].zero_()
+    out, _ = run(q, k, v2, kcw, vcw, indptr, idx, mode="sig", sigred=sigred)
+    ref, _ = run(q, k, v, kcw, vcw, indptr, idx, mode="full")
+    e = ss.errors()
+    assert e[8] >= 1 and e[2] == 2, e
+    assert torch.equal(out, ref)
+
+
 @pytest.mark.parametrize("mode", ["full", "gate", "sig"])
 def test_write_back_fixes_buffer_once(mode):
     q, k, v, indptr, idx, _ = setup()

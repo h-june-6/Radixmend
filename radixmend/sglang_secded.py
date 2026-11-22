@@ -289,10 +289,11 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
     """Attention over one KV split. WB: write corrected words back to the KV buffer. TM: 0 no check, 1 full, 2 gate, 3 signature (no correction).
 
     TM 3 only accumulates, element-wise, the XOR of every K and V word and of the
-    stored checkwords; one reduction at the end compares the parity / bit
-    syndrome of the total. Any odd number of flipped bits in the split shows up
-    (p changes); even-weight patterns whose bit labels cancel are missed. The
-    caller redoes the split with TM 1 when ``bad`` is set.
+    stored checkwords; at the end the full syndrome (p, S_e, S_b) of the per-element
+    totals is compared with the XOR of the stored checkwords (see ``_sig_bad``). Any
+    odd number of flipped bits shows up (p changes) and so does any 2-bit pattern
+    except the same element and bit in two vectors of the split. The caller redoes
+    the split with TM 1 when ``bad`` is set.
     """
     e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
@@ -438,20 +439,33 @@ def _split(q_k, K_Buffer, V_Buffer, K_CW, V_CW, kv_indices, kv_start_idx, split_
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
     if TM == 3:
-        bad = _sig_bad(xk_acc, ck_acc, bmask_ptr, E, B) | _sig_bad(xv_acc, cv_acc, bmask_ptr, E, B)
+        # per-element XOR words: K tiles are [D, N], V tiles [N, DV]
+        bad = (_sig_bad(tl.reduce(xk_acc, 1, _xor), ck_acc, tl.load(elab_ptr + offs_d), bmask_ptr, E, B)
+               | _sig_bad(tl.reduce(xv_acc, 0, _xor), cv_acc, tl.load(elab_ptr + offs_dv), bmask_ptr, E, B))
     return acc, e_sum, e_max, nk_fix, nk_bad, nv_fix, nv_bad, bad, n_cw
 
 
 @triton.jit
-def _sig_bad(x_acc, c_acc, bmask_ptr, E: tl.constexpr, B: tl.constexpr):
-    """1 if the (p, S_b) signature of the XOR of all words differs from the stored one."""
-    c = tl.reduce(tl.reduce(x_acc, 1, _xor), 0, _xor).to(tl.int32) & 0xFFFF
+def _sig_bad(w, c_acc, e_lab, bmask_ptr, E: tl.constexpr, B: tl.constexpr):
+    """1 if the (p, S_e, S_b) syndrome of the XOR of all vectors differs from the XOR of their
+    stored checkwords (the code is linear, so a clean split always matches).
+
+    w: one XOR word per element (all vectors of the split folded). S_e (one popcount per
+    element, once per split) catches what p and S_b alone miss: two flips at the same bit
+    position in different elements, e.g. a 2-bit error (14, 14) in one vector or two 1-bit
+    errors in two vectors of one split. What still cancels is the same element and bit
+    flipped in two vectors of one split (an XOR of zero).
+    """
+    w = w.to(tl.int32) & 0xFFFF
+    c = tl.reduce(w, 0, _xor)
     cw = tl.reduce(c_acc, 0, _xor).to(tl.int32) & 0xFFFF
     p1 = _par16(c)
     sb1 = _sb_of(c, bmask_ptr, B)
+    se1 = tl.reduce(tl.where(_par16(w) == 1, e_lab, 0), 0, _xor)
     p0 = cw & 1
+    se0 = (cw >> 1) & ((1 << E) - 1)
     sb0 = (cw >> (1 + E)) & ((1 << B) - 1)
-    return ((p1 != p0) | (sb1 != sb0)).to(tl.int32)
+    return ((p1 != p0) | (sb1 != sb0) | (se1 != se0)).to(tl.int32)
 
 
 @triton.jit
