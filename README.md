@@ -1,6 +1,6 @@
 # RadixMend
 
-SGLang radix tree KV 캐시의 비트플립을 attention 커널이 KV를 읽는 순간 교정하는 연구 코드다. 이 저장소에는 지금 GPU 없이 만들고 검증할 수 있는 부분만 들어 있다.
+SGLang radix tree KV 캐시의 비트플립을 attention 커널이 KV를 읽는 순간 교정하는 대응책이다.
 
 ## 구성
 
