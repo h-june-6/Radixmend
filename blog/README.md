@@ -13,7 +13,11 @@ WBS 16주 계획의 주차에 맞춰 나눈 글들이다. 3주차부터는 서�
 | 6 | 구현 (모듈 A) | [week06.md](week06.md) | 체크워드 버퍼, decode 커널 융합, extend 사전 검사, 첫 비용 측정 | |
 | 7 | 구현 (모듈 A) | [week07.md](week07.md) | gate·popc·샘플링·sig 변형, 생성 중 주입, 되쓰기, RQ2 교정·탐지율 | |
 | 8 | decode 검사 비용 줄이기 | [week08.md](week08.md) | 재계산 launch 분리(레지스터 255→96), 버린 시도, launch 설정 조정, 모듈 A 파생 오염 실험 | |
-| 11 (선행) | 구현 (모듈 B) | [week11.md](week11.md) | 인덱스 SECDED 인코딩 구현·전수 검증, 소비 지점과 choke point 정리 | 12주차 삽입과 서버 검증 |
+| 9 | 구현 (모듈 C) | [week09.md](week09.md) | 오류 로그 기반 retract·재계산, poison과 재삽입 되쓰기, FrozenInstanceError, 동시 요청 피해 범위, 강제 재계산 대조로 재계산 경로 차이 확인 | |
+| 10 | 구현 (모듈 D) | [week10.md](week10.md) | 재사용 prefix 사본, 커널 안 복원, CUDA graph 안전한 무효화, 재계산 0·지연 0.05초, 나중에 찾은 864토큰 TTFT 원인 | |
+| 11 | 구현 (모듈 B) | [week11.md](week11.md) | node.value 상위 비트·req_to_token 그림자 표, kv_indices 길목 검사, RQ1-5 크래시·변화 0, TTFT +138%와 커널 launch 폭증 | |
+| 12 | 구현 (모듈 B) | [week12.md](week12.md) | 커널 합치기로 TTFT +0.5%, free_pages 인코딩, seq_lens CPU 사본 복원, 없는 함수 감싸기 실패, 늦은 복원 수정 | |
+| 13 | 통합 | [week13.md](week13.md) | 네 모듈 통합 결함 시험, 모듈 C overlap 지원, `.item()` 동기로 TTFT +94% → 비동기 스냅샷 +10%, 2단계 강제 재계산 대조 | |
 | 15 (선행) | 평가 완료 | [week15.md](week15.md) | 코드워드 길이 트레이드오프, 3비트 한계 시뮬레이션 | 실제 플립 분포 반영, 오버헤드, 출력 영향 |
 
-9, 10, 12~14, 16주차 글은 아직 없다.
+14, 16주차 글은 아직 없다. 11주차는 처음에 선행 글(인코딩만)로 썼다가 실제 구현 글로 바꿨다(이전 판은 git 기록에 있다).
