@@ -347,8 +347,10 @@ def check_row(pool, row: int, n: int) -> None:
     if sh is None or n <= 0:
         return
     dev = pool.req_to_token.device
-    rows = torch.tensor([row], dtype=torch.int64, device=dev)
-    lens = torch.tensor([n], dtype=torch.int64, device=dev)
+    # torch.full launches a fill kernel; torch.tensor([...], device=cuda) would be a blocking
+    # host-to-device copy, a host sync in the scheduler that stalls overlap (+24-80% TTFT)
+    rows = torch.full((1,), row, dtype=torch.int64, device=dev)
+    lens = torch.full((1,), n, dtype=torch.int64, device=dev)
     indptr = torch.zeros(1, dtype=torch.int64, device=dev)
     out = torch.empty(n, dtype=pool.req_to_token.dtype, device=dev)  # only fixed entries are written
     check_gather(pool.req_to_token, sh, rows, lens, indptr, None, out)

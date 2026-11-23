@@ -90,16 +90,51 @@ def _as_float(raw: int, dtype: torch.dtype) -> float | None:
 
 
 def inject_kv(k_buffer: Sequence[torch.Tensor], v_buffer: Sequence[torch.Tensor], faults: Iterable[KVFault]) -> list[FlipRecord]:
-    records = []
-    for f in faults:
-        buf = (k_buffer if f.kind == "k" else v_buffer)[f.layer]
+    """Apply all flips of each buffer with one write, so a multi-bit fault lands at once.
+
+    Flipping bit by bit (one read-modify-write per bit) let a decode step that ran in
+    between (overlap scheduling) see, correct and write back the first flip as a single-bit
+    error, then the second one a step later: a 2-bit fault measured as two 1-bit faults.
+    """
+    faults = list(faults)
+    groups: dict[tuple[str, int], list[int]] = {}
+    for i, f in enumerate(faults):
+        groups.setdefault((f.kind, f.layer), []).append(i)
+    recs: dict[int, tuple[int, int]] = {}
+    for (kind, layer), ids in groups.items():
+        buf = (k_buffer if kind == "k" else v_buffer)[layer]
         _, heads, dim = buf.shape
-        flat = (f.slot * heads + f.head) * dim + f.elem
-        (old, new), = flip_bits_(buf, [flat], [f.bit])
+        iv = int_view(buf).reshape(-1)
+        width = torch.iinfo(iv.dtype).bits
+        flat_of = {}
+        for i in ids:
+            f = faults[i]
+            if not 0 <= f.bit < width:
+                raise ValueError(f"bit {f.bit} out of range for {width}-bit elements")
+            flat_of[i] = (f.slot * heads + f.head) * dim + f.elem
+        flats = sorted(set(flat_of.values()))
+        idx = torch.tensor(flats, dtype=torch.int64, device=iv.device)
+        cur = dict(zip(flats, iv[idx].tolist()))
+        for i in ids:  # per-flip (old, new) in order, as if applied one by one
+            x = flat_of[i]
+            o = cur[x]
+            n = _signed((o ^ (1 << faults[i].bit)) & ((1 << width) - 1), width)
+            recs[i] = (o, n)
+            cur[x] = n
+        # one write for every flip of this buffer
+        iv[idx] = torch.tensor([cur[x] for x in flats], dtype=iv.dtype, device=iv.device)
+    records = []
+    for i, f in enumerate(faults):
+        buf = (k_buffer if f.kind == "k" else v_buffer)[f.layer]
+        old, new = recs[i]
         records.append(
             FlipRecord("kv", asdict(f), old, new, _as_float(old, buf.dtype), _as_float(new, buf.dtype))
         )
     return records
+
+
+def _signed(v: int, width: int) -> int:
+    return v - (1 << width) if v >= 1 << (width - 1) else v
 
 
 def sample_kv_faults(
